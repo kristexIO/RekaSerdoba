@@ -1,0 +1,39 @@
+{
+	admin 127.0.0.1:2019
+	servers {
+		protocols h1 h2
+	}
+}
+
+messk.online {
+	encode zstd gzip
+
+	@reka path /connect/v1/stream /connect/v1/h2
+	reverse_proxy @reka 127.0.0.1:9080 {
+		flush_interval -1
+	}
+
+	@manifest path /.well-known/rekaserdoba/manifest.cbor
+	header @manifest Content-Type application/cose
+
+	root * /var/www/rekaserdoba
+	file_server
+
+	header {
+		Alt-Svc "h3=\":443\"; ma=2592000"
+		Permissions-Policy "camera=(), geolocation=(), microphone=()"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/messk-access.log {
+			roll_size 10MiB
+			roll_keep 5
+			roll_keep_for 168h
+		}
+		format json
+	}
+}

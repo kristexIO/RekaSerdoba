@@ -1,0 +1,49 @@
+name: Bug report
+description: Report a reproducible defect
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include device bundles, private keys, tokens, or personal packet captures.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Rust server
+        - Windows service
+        - Windows GUI
+        - H3 bridge
+        - H2 carrier
+        - WSS carrier
+        - Deployment
+        - Protocol specification
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Include exact steps and sanitized logs.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or version
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, carrier, network type and relevant security software.
+    validations:
+      required: true

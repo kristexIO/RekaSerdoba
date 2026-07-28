@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic RekaSerdoba TLS identity synchronization
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+Persistent=true
+Unit=rekaserdoba-tls-sync.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Synchronize RekaSerdoba QUIC TLS identity from Caddy
+After=caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rekaserdoba-sync-tls
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/etc/rekaserdoba/tls
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native

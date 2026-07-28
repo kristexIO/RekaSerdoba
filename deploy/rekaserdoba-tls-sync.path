@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch Caddy certificate rotation for RekaSerdoba
+
+[Path]
+PathChanged=/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/messk.online/messk.online.crt
+PathChanged=/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/messk.online/messk.online.key
+Unit=rekaserdoba-tls-sync.service
+
+[Install]
+WantedBy=multi-user.target

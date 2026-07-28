@@ -1,0 +1,35 @@
+{
+  "listen": "127.0.0.1:9080",
+  "authority": "vpn.example.com:443",
+  "tunnel_path": "/connect/v1/stream",
+  "server_signing_seed_b64": "<BASE64URL_32_BYTE_SERVER_SEED>",
+  "clients": [
+    {
+      "client_id_b64": "<BASE64URL_16_BYTE_CLIENT_ID>",
+      "client_public_key_b64": "<BASE64URL_32_BYTE_ED25519_PUBLIC_KEY>",
+      "gate_key_b64": "<BASE64URL_32_BYTE_GATE_KEY>",
+      "tunnel_ipv4": "10.77.0.2",
+      "revoked": false,
+      "session_lifetime_seconds": 3600,
+      "bandwidth_bytes_per_second": 26214400,
+      "session_quota_bytes": 0
+    }
+  ],
+  "tun": {
+    "name": "reka0",
+    "address": "10.77.0.1",
+    "prefix_len": 24,
+    "mtu": 1280,
+    "session_queue": 512,
+    "helper_socket": "/run/rekaserdoba/net.sock",
+    "helper_client_socket": "/run/rekaserdoba/edge.sock"
+  },
+  "h3": {
+    "listen": "0.0.0.0:443",
+    "authority": "vpn.example.com:443",
+    "path": "/connect/v1/h3",
+    "certificate_pem": "/etc/rekaserdoba/tls/server.crt",
+    "private_key_pem": "/etc/rekaserdoba/tls/server.key",
+    "decoy_root": "/var/www/rekaserdoba"
+  }
+}

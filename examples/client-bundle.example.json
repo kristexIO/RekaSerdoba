@@ -1,0 +1,17 @@
+{
+  "format": "RekaSerdoba laboratory device bundle 0.1",
+  "warning": "Template only. Generate unique values for every device.",
+  "endpoint": "wss://vpn.example.com/connect/v1/stream",
+  "authority": "vpn.example.com:443",
+  "client_id_b64": "<BASE64URL_16_BYTE_CLIENT_ID>",
+  "client_signing_seed_b64": "<BASE64URL_32_BYTE_ED25519_SEED>",
+  "client_public_key_b64": "<BASE64URL_32_BYTE_ED25519_PUBLIC_KEY>",
+  "gate_key_b64": "<BASE64URL_32_BYTE_GATE_KEY>",
+  "server_public_key_b64": "<BASE64URL_32_BYTE_SERVER_PUBLIC_KEY>",
+  "server_key_id_b64": "<BASE64URL_16_BYTE_SERVER_KEY_ID>",
+  "tunnel_ipv4": "10.77.0.2/24",
+  "profile_id_b64": "<BASE64URL_16_BYTE_PROFILE_ID>",
+  "manifest_signing_public_key_b64": "<BASE64URL_32_BYTE_MANIFEST_PUBLIC_KEY>",
+  "manifest_url": "https://vpn.example.com/.well-known/rekaserdoba/manifest.cbor",
+  "manifest_sequence": 1
+}

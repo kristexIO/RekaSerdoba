@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+source_dir=/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/messk.online
+target_dir=/etc/rekaserdoba/tls
+changed=0
+
+install -d -o root -g rekaserdoba -m 0750 "$target_dir"
+if ! cmp -s "$source_dir/messk.online.crt" "$target_dir/server.crt"; then
+    install -o root -g rekaserdoba -m 0640 "$source_dir/messk.online.crt" "$target_dir/server.crt.new"
+    mv "$target_dir/server.crt.new" "$target_dir/server.crt"
+    changed=1
+fi
+if ! cmp -s "$source_dir/messk.online.key" "$target_dir/server.key"; then
+    install -o root -g rekaserdoba -m 0640 "$source_dir/messk.online.key" "$target_dir/server.key.new"
+    mv "$target_dir/server.key.new" "$target_dir/server.key"
+    changed=1
+fi
+if [ "$changed" -eq 1 ]; then
+    systemctl try-restart rekaserdoba.service
+fi

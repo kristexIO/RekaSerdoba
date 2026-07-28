@@ -1,0 +1,17 @@
+[Unit]
+Description=RekaSerdoba local health check
+After=rekaserdoba.service
+OnFailure=rekaserdoba-recover.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/curl --fail --silent --show-error --max-time 5 http://127.0.0.1:9080/healthz
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native

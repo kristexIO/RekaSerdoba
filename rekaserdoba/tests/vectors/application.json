@@ -1,0 +1,11 @@
+{
+  "epoch_secret_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "session_id_b64": "AAECAwQFBgcICQoLDA0ODw",
+  "epoch": 7,
+  "data_c2s_key_b64": "0FbbsJJUOtxByHD06FL3HJx57nup6tw_CabZyLWhWuo",
+  "data_c2s_iv_b64": "ShygwQuu0eHmPhMm",
+  "control_s2c_key_b64": "Lebznwrg9s42015M0LmwpHawMYoK5cd4UJx4ILgusw8",
+  "control_s2c_iv_b64": "rMPN2etujBlSyLh1",
+  "packet_number": 72623859790382856,
+  "nonce_b64": "ShygwQqs0uXjOBQu"
+}

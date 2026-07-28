@@ -1,0 +1,6 @@
+[Unit]
+Description=RekaSerdoba health recovery
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart rekaserdoba.service
