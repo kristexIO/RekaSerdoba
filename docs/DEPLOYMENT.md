@@ -17,7 +17,7 @@ This guide describes the shape of a deployment, not a universal one-command prod
 git clone https://github.com/kristexIO/RekaSerdoba.git
 cd RekaSerdoba/rekaserdoba
 cargo test --locked
-cargo build --locked --release
+REKASERDOBA_BUILD_SHA="$(git rev-parse HEAD)" cargo build --locked --release
 ```
 
 Install the two privileged components separately:
@@ -86,6 +86,7 @@ sudo install -m 0644 deploy/rekaserdoba-net-helper.service /etc/systemd/system/
 sudo install -m 0644 deploy/rekaserdoba.service /etc/systemd/system/
 sudo install -m 0644 deploy/rekaserdoba-health.service /etc/systemd/system/
 sudo install -m 0644 deploy/rekaserdoba-health.timer /etc/systemd/system/
+sudo install -m 0755 deploy/rekaserdoba-health-check /usr/local/libexec/
 sudo systemctl daemon-reload
 sudo systemctl enable --now rekaserdoba-net-helper.service
 sudo systemctl enable --now rekaserdoba.service
@@ -115,6 +116,7 @@ https://your-domain.example/.well-known/rekaserdoba/manifest.cbor
 systemctl is-active rekaserdoba
 systemctl is-active rekaserdoba-net-helper
 curl --fail http://127.0.0.1:9080/healthz
+curl --fail http://127.0.0.1:9080/readyz
 journalctl -u rekaserdoba -n 100 --no-pager
 ```
 
@@ -141,4 +143,18 @@ The setup executable embeds the selected bundle. Treat every built installer as 
 
 ## Rollback
 
-Keep the previous server binary and unit files until health checks and an end-to-end carrier test pass. Replace binaries atomically, then restart only the affected service. Never roll back identity state or manifest sequence without also handling client anti-rollback state.
+Create a checksummed release directory and deploy it atomically:
+
+```bash
+bash deploy/package-release.sh rekaserdoba/target/release /secure/release "$(git rev-parse HEAD)"
+sudo bash deploy/deploy-release.sh /secure/release
+```
+
+The deploy command prints the backup path. To verify and restore it:
+
+```bash
+sudo bash deploy/verify-backup.sh /var/backups/rekaserdoba/YYYYMMDDTHHMMSSZ
+sudo bash deploy/rollback-release.sh /var/backups/rekaserdoba/YYYYMMDDTHHMMSSZ
+```
+
+Never roll back identity state or manifest sequence without also handling client anti-rollback state.

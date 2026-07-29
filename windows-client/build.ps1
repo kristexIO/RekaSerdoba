@@ -1,6 +1,8 @@
 param(
     [string]$Bundle,
-    [string]$Python
+    [string]$Python,
+    [string]$SigningCertificateThumbprint,
+    [string]$TimestampServer = "http://timestamp.digicert.com"
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,6 +20,23 @@ if (-not (Test-Path -LiteralPath $Bundle -PathType Leaf)) {
 $python = $Python
 $dependencies = Join-Path $root ".codex-temp\clientdeps"
 $output = Join-Path $PSScriptRoot "dist"
+function Invoke-Sign {
+    param([string[]]$Paths)
+    if (-not $SigningCertificateThumbprint) {
+        return
+    }
+    $signTool = (Get-Command signtool.exe -ErrorAction Stop).Source
+    foreach ($path in $Paths) {
+        & $signTool sign /sha1 $SigningCertificateThumbprint /fd SHA256 /tr $TimestampServer /td SHA256 $path
+        if ($LASTEXITCODE -ne 0) {
+            throw "Authenticode signing failed: $path"
+        }
+        $signature = Get-AuthenticodeSignature -LiteralPath $path
+        if ($signature.Status -ne "Valid") {
+            throw "Authenticode verification failed: $path"
+        }
+    }
+}
 & $python -m pip install --disable-pip-version-check --upgrade --target $dependencies "pyinstaller==6.21.0" "pywin32==311" "h2==4.3.0"
 $env:PYTHONPATH = "$dependencies;$(Join-Path $dependencies 'win32');$(Join-Path $dependencies 'win32\lib');$root;$PSScriptRoot"
 & $python -m PyInstaller `
@@ -51,6 +70,11 @@ $env:PYTHONPATH = "$dependencies;$(Join-Path $dependencies 'win32');$(Join-Path 
     --specpath (Join-Path $root ".codex-temp") `
     --paths $PSScriptRoot `
     (Join-Path $PSScriptRoot "gui.py")
+Invoke-Sign -Paths @(
+    (Join-Path $output "RekaSerdoba.exe"),
+    (Join-Path $output "reka-service.exe"),
+    (Join-Path $PSScriptRoot "h3_bridge.exe")
+)
 & $python -m PyInstaller `
     --noconfirm `
     --clean `
@@ -68,6 +92,7 @@ $env:PYTHONPATH = "$dependencies;$(Join-Path $dependencies 'win32');$(Join-Path 
     --add-data "$Bundle;RekaSerdoba_client_bundle.json" `
     --add-data "$(Join-Path $PSScriptRoot 'WINTUN_LICENSE.txt');." `
     (Join-Path $PSScriptRoot "setup.py")
+Invoke-Sign -Paths @((Join-Path $output "RekaSerdoba_Setup.exe"))
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "h3_bridge.exe") -Destination $output
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "wintun.dll") -Destination $output
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install.ps1") -Destination $output

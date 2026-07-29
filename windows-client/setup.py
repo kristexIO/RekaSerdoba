@@ -9,10 +9,11 @@ import time
 import winreg
 from pathlib import Path
 
+from version import VERSION
 
 SERVICE_NAME = "RekaSerdoba"
 DISPLAY_NAME = "RekaSerdoba"
-PRODUCT_VERSION = "0.1.0"
+PRODUCT_VERSION = VERSION
 ASSETS = (
     "RekaSerdoba.exe",
     "reka-service.exe",
@@ -83,6 +84,25 @@ def service_exists():
     return run(["sc.exe", "query", SERVICE_NAME], check=False).returncode == 0
 
 
+def authenticode(path):
+    escaped = str(path).replace("'", "''")
+    script = (
+        f"$s=Get-AuthenticodeSignature -LiteralPath '{escaped}';"
+        "$t=if($s.SignerCertificate){$s.SignerCertificate.Thumbprint}else{''};"
+        "[pscustomobject]@{Status=$s.Status.ToString();Thumbprint=$t}|ConvertTo-Json -Compress"
+    )
+    result = run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ]
+    )
+    return json.loads(result.stdout)
+
+
 def wait_for_service_absence(timeout=15):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -127,6 +147,16 @@ def validate_assets():
     absent = sorted(required.difference(bundle))
     if absent:
         raise RuntimeError("Конфигурация неполная: " + ", ".join(absent))
+    if getattr(sys, "frozen", False):
+        installer_signature = authenticode(Path(sys.executable))
+    else:
+        installer_signature = {"Status": "NotSigned", "Thumbprint": ""}
+    if installer_signature["Status"] == "Valid":
+        expected = installer_signature["Thumbprint"]
+        for name in ("RekaSerdoba.exe", "reka-service.exe", "h3_bridge.exe"):
+            signature = authenticode(source / name)
+            if signature["Status"] != "Valid" or signature["Thumbprint"] != expected:
+                raise RuntimeError("Недействительная подпись компонента: " + name)
 
 
 def copy_assets(destination):
@@ -135,6 +165,35 @@ def copy_assets(destination):
     for name in ASSETS:
         shutil.copy2(source / name, destination / name)
     shutil.copy2(Path(sys.executable), destination / "RekaSerdoba_Setup.exe")
+
+
+def activate_staged_version(destination):
+    staging = destination.with_name(destination.name + ".new")
+    previous = destination.with_name(destination.name + ".previous")
+    if staging.exists():
+        shutil.rmtree(staging)
+    if previous.exists():
+        shutil.rmtree(previous)
+    copy_assets(staging)
+    if destination.exists():
+        os.replace(destination, previous)
+    os.replace(staging, destination)
+    return previous
+
+
+def rollback_staged_version(destination, previous):
+    failed = destination.with_name(destination.name + ".failed")
+    if failed.exists():
+        shutil.rmtree(failed)
+    if destination.exists():
+        os.replace(destination, failed)
+    if previous.exists():
+        os.replace(previous, destination)
+        service = destination / "reka-service.exe"
+        run([service, "install"])
+        run([service, "start"])
+    if failed.exists():
+        shutil.rmtree(failed)
 
 
 def register_uninstaller(destination):
@@ -220,23 +279,33 @@ def install():
     destination = target_dir()
     run(["taskkill.exe", "/IM", "RekaSerdoba.exe", "/F"], check=False)
     stop_existing_service(destination)
-    copy_assets(destination)
-    service = destination / "reka-service.exe"
-    bundle = destination / "RekaSerdoba_client_bundle.json"
-    run([service, "import", bundle])
-    check = run([service, "check"])
-    run([service, "install"])
-    run([service, "start"])
-    time.sleep(3)
-    query = run(["sc.exe", "query", SERVICE_NAME])
-    if "RUNNING" not in query.stdout:
-        raise RuntimeError("Служба установлена, но не перешла в состояние RUNNING")
-    register_uninstaller(destination)
-    create_shortcuts(destination)
+    previous = activate_staged_version(destination)
+    try:
+        service = destination / "reka-service.exe"
+        bundle = destination / "RekaSerdoba_client_bundle.json"
+        run([service, "import", bundle])
+        check = run([service, "check"])
+        run([service, "install"])
+        run([service, "start"])
+        time.sleep(3)
+        query = run(["sc.exe", "query", SERVICE_NAME])
+        if "RUNNING" not in query.stdout:
+            raise RuntimeError("Служба установлена, но не перешла в состояние RUNNING")
+        register_uninstaller(destination)
+        create_shortcuts(destination)
+    except Exception:
+        stop_existing_service(destination)
+        rollback_staged_version(destination, previous)
+        raise
+    if previous.exists():
+        shutil.rmtree(previous)
     return check.stdout.strip()
 
 
 def recover_after_failure():
+    query = run(["sc.exe", "query", SERVICE_NAME], check=False)
+    if "RUNNING" in query.stdout:
+        return
     service = target_dir() / "reka-service.exe"
     if service.exists():
         run([service, "recover"], check=False)

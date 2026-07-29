@@ -9,11 +9,13 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 from client_core import CarrierScores, ManifestState, RekaSession, load_manifest
 from network_policy import NetworkPolicy
 from secret_store import import_bundle, load_bundle
+from version import VERSION
 from wintun_adapter import WintunAdapter
 
 try:
@@ -37,6 +39,83 @@ SCORES = ROOT / "carrier-scores.json"
 POLICY_STATE = ROOT / "network-policy.json"
 LOG_PATH = ROOT / "service.log"
 SETTINGS = ROOT / "settings.json"
+STATUS = ROOT / "status.json"
+
+
+def write_status(state, carrier=None, reason=None):
+    ROOT.mkdir(parents=True, exist_ok=True)
+    value = {
+        "version": VERSION,
+        "state": state,
+        "updated_at": int(time.time()),
+    }
+    if carrier:
+        value["carrier"] = carrier
+    if reason:
+        value["reason"] = reason
+    temporary = STATUS.with_suffix(".new")
+    temporary.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
+    os.replace(temporary, STATUS)
+
+
+def read_status():
+    try:
+        return json.loads(STATUS.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {"version": VERSION, "state": "unknown"}
+
+
+def redact_log(value):
+    redacted = []
+    for line in value.splitlines():
+        lowered = line.lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "gate_key",
+                "signing_seed",
+                "authorization",
+                "bearer ",
+                "device.dpapi",
+            )
+        ):
+            redacted.append("[redacted]")
+        else:
+            redacted.append(line[-2000:])
+    return "\n".join(redacted[-2000:]) + "\n"
+
+
+def create_diagnostics(output):
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    service = subprocess.run(
+        ["sc.exe", "query", SERVICE_NAME],
+        check=False,
+        capture_output=True,
+        text=True,
+    ) if os.name == "nt" else None
+    report = {
+        "version": VERSION,
+        "platform": sys.platform,
+        "python": sys.version,
+        "status": read_status(),
+        "service": service.stdout[-8000:] if service else "not-windows",
+    }
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("report.json", json.dumps(report, indent=2, sort_keys=True))
+        for path in (SCORES, SETTINGS):
+            try:
+                archive.writestr(path.name, path.read_text(encoding="utf-8")[-65536:])
+            except OSError:
+                pass
+        try:
+            archive.writestr(
+                "service.log",
+                redact_log(LOG_PATH.read_text(encoding="utf-8", errors="replace")),
+            )
+        except OSError:
+            pass
+    return output
 
 
 def transport_mode(path=SETTINGS):
@@ -74,9 +153,11 @@ class TunnelRuntime:
         self.policy = None
         self.session = None
         self.runtime_bundle = None
+        self.carrier_name = None
 
     def run(self):
         configure_logging()
+        write_status("starting")
         bundle = load_bundle(BUNDLE)
         state = ManifestState(MANIFEST_STATE)
         scores = CarrierScores(SCORES)
@@ -103,10 +184,15 @@ class TunnelRuntime:
             self.policy.recover()
         try:
             while not self.stop_event.is_set():
+                attempted = False
                 for choice in scores.order(choices):
                     if self.stop_event.is_set():
                         break
+                    if scores.wait_seconds(choice.name) > 0:
+                        continue
+                    attempted = True
                     try:
+                        write_status("connecting", choice.name)
                         if self.policy:
                             self.policy.prepare(endpoint_ip)
                             logging.info(
@@ -125,10 +211,13 @@ class TunnelRuntime:
                             bridge if bridge.exists() else None,
                         )
                         scores.success(choice.name)
+                        self.carrier_name = choice.name
+                        write_status("connected", choice.name)
                         logging.info("carrier connected name=%s", choice.name)
                         self._pump(endpoint_ip)
                     except Exception as error:
                         scores.failure(choice.name)
+                        write_status("reconnecting", choice.name, type(error).__name__)
                         logging.warning(
                             "carrier failed name=%s reason=%r",
                             choice.name,
@@ -143,9 +232,12 @@ class TunnelRuntime:
                         if self.session:
                             self.session.close()
                             self.session = None
+                        self.carrier_name = None
                 if not self.stop_event.is_set():
-                    self.stop_event.wait(2)
+                    delay = 2 if attempted else scores.next_retry_seconds(choices)
+                    self.stop_event.wait(min(max(delay, 1), 30))
         finally:
+            write_status("stopped")
             if self.session:
                 self.session.close()
             if self.adapter:
@@ -198,6 +290,7 @@ class TunnelRuntime:
             if self.policy and endpoint_ip:
                 self.policy.install(endpoint_ip)
             keepalive = time.monotonic() + 15
+            status_heartbeat = time.monotonic() + 10
             while (
                 not self.stop_event.is_set()
                 and failure.empty()
@@ -216,6 +309,9 @@ class TunnelRuntime:
                 if time.monotonic() >= keepalive:
                     self.session.send_keepalive()
                     keepalive = time.monotonic() + 15
+                if time.monotonic() >= status_heartbeat:
+                    write_status("connected", self.carrier_name)
+                    status_heartbeat = time.monotonic() + 10
             if not failure.empty():
                 raise failure.get()
         finally:
@@ -327,6 +423,15 @@ def main():
     load = sub.add_parser("import")
     load.add_argument("bundle", type=Path)
     sub.add_parser("check")
+    diagnostics = sub.add_parser("diagnostics")
+    diagnostics.add_argument(
+        "output",
+        type=Path,
+        nargs="?",
+        default=ROOT / "diagnostics.zip",
+    )
+    sub.add_parser("status")
+    sub.add_parser("version")
     sub.add_parser("console")
     sub.add_parser("recover")
     sub.add_parser("install")
@@ -340,6 +445,12 @@ def main():
         print(BUNDLE)
     elif args.command == "check":
         connection_check()
+    elif args.command == "diagnostics":
+        print(create_diagnostics(args.output))
+    elif args.command == "status":
+        print(json.dumps(read_status(), sort_keys=True))
+    elif args.command == "version":
+        print(VERSION)
     elif args.command == "console":
         TunnelRuntime(threading.Event()).run()
     elif args.command == "recover":

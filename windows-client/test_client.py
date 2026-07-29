@@ -2,6 +2,7 @@ import json
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -14,9 +15,16 @@ from client_core import (
     _close_carrier,
     _parse_frames,
 )
-from reka_service import _valid_ipv4_packet, select_transport_choices, transport_mode
+from reka_service import (
+    _valid_ipv4_packet,
+    create_diagnostics,
+    redact_log,
+    select_transport_choices,
+    transport_mode,
+)
 from network_policy import NetworkPolicy
 from secret_store import protect, unprotect
+from setup import activate_staged_version, rollback_staged_version
 
 
 class ClientTests(unittest.TestCase):
@@ -133,6 +141,65 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(scores.order(choices)[0].name, "h2")
             value = json.loads(scores.path.read_text(encoding="utf-8"))
             self.assertGreater(value["h3"]["cooldown"], time.time())
+            self.assertGreater(scores.wait_seconds("h3"), 0)
+            self.assertGreater(scores.next_retry_seconds(choices), 0)
+
+    def test_diagnostics_excludes_secrets_and_redacts_logs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {
+                "ROOT": root,
+                "STATUS": root / "status.json",
+                "SCORES": root / "carrier-scores.json",
+                "SETTINGS": root / "settings.json",
+                "LOG_PATH": root / "service.log",
+            }
+            paths["STATUS"].write_text('{"state":"connected"}', encoding="utf-8")
+            paths["SCORES"].write_text('{"h3":{"failures":0}}', encoding="utf-8")
+            paths["SETTINGS"].write_text('{"transport":"auto"}', encoding="utf-8")
+            paths["LOG_PATH"].write_text(
+                "normal line\nauthorization Bearer secret\n",
+                encoding="utf-8",
+            )
+            bundle = root / "device.dpapi"
+            bundle.write_bytes(b"private")
+            output = root / "diagnostics.zip"
+            with patch.multiple("reka_service", **paths):
+                create_diagnostics(output)
+            with zipfile.ZipFile(output) as archive:
+                self.assertNotIn("device.dpapi", archive.namelist())
+                log = archive.read("service.log").decode("utf-8")
+                self.assertIn("normal line", log)
+                self.assertIn("[redacted]", log)
+                self.assertNotIn("secret", log)
+
+    def test_log_redaction_is_bounded(self):
+        value = redact_log("x" * 5000)
+        self.assertLessEqual(len(value), 2001)
+
+    def test_staged_update_can_restore_previous_version(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "RekaSerdoba"
+            destination.mkdir()
+            (destination / "version.txt").write_text("old", encoding="utf-8")
+
+            def copy_new(path):
+                path.mkdir()
+                (path / "version.txt").write_text("new", encoding="utf-8")
+                (path / "reka-service.exe").write_bytes(b"service")
+
+            with patch("setup.copy_assets", side_effect=copy_new):
+                previous = activate_staged_version(destination)
+            self.assertEqual(
+                (destination / "version.txt").read_text(encoding="utf-8"),
+                "new",
+            )
+            with patch("setup.run"):
+                rollback_staged_version(destination, previous)
+            self.assertEqual(
+                (destination / "version.txt").read_text(encoding="utf-8"),
+                "old",
+            )
 
     def test_frame_bounds(self):
         self.assertEqual(_parse_frames(b"\x01\0\0\x03abc"), [(1, b"abc")])

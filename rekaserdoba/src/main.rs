@@ -1,11 +1,11 @@
 use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -23,6 +23,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::BytesMut;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit, Payload},
@@ -34,7 +35,7 @@ use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tracing::{info, warn};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -69,6 +70,9 @@ const GATE_WINDOW_SECS: i64 = 90;
 const GATE_REPLAY_SECS: u64 = 180;
 const H2_PATH: &str = "/connect/v1/h2";
 const H3_EXPORTER_LABEL: &[u8] = b"EXPORTER-RekaSerdoba-gate";
+const BUILD_SHA: &str = env!("REKASERDOBA_BUILD_SHA");
+const MAX_ACTIVE_CARRIERS: usize = 1024;
+const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 const DECOY_HTML: &str = r#"<!doctype html>
 <html lang="ru">
@@ -167,6 +171,9 @@ struct AppState {
     runtime: Arc<Runtime>,
     network: Network,
     metrics: Arc<Metrics>,
+    draining: Arc<AtomicBool>,
+    h3_ready: Arc<AtomicBool>,
+    carriers: Arc<Semaphore>,
 }
 
 #[derive(Default)]
@@ -176,6 +183,19 @@ struct Metrics {
     sessions_total: AtomicU64,
     sessions_active: AtomicU64,
     migrations_total: AtomicU64,
+    overloaded_total: AtomicU64,
+    disconnects_expected_total: AtomicU64,
+    disconnects_error_total: AtomicU64,
+    handshake_duration_micros_total: AtomicU64,
+    handshake_attempts_total: AtomicU64,
+    shaping_delay_micros_total: AtomicU64,
+    wss_sessions_total: AtomicU64,
+    h2_sessions_total: AtomicU64,
+    h3_sessions_total: AtomicU64,
+    routine_rekeys_total: AtomicU64,
+    full_rekeys_total: AtomicU64,
+    rekey_failed_total: AtomicU64,
+    migration_failed_total: AtomicU64,
 }
 
 struct ActiveSession(Arc<Metrics>);
@@ -209,12 +229,12 @@ enum Carrier {
 struct H2Carrier {
     input: BodyDataStream,
     output: mpsc::Sender<Result<Bytes, Infallible>>,
-    buffered: Vec<u8>,
+    buffered: BytesMut,
 }
 
 struct H3Carrier {
     session: h3_edge::Session,
-    buffered: Vec<u8>,
+    buffered: BytesMut,
     application_ready: bool,
 }
 
@@ -225,7 +245,7 @@ enum CarrierEvent {
     Ignore,
 }
 
-fn take_carrier_message(buffered: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
+fn take_carrier_message(buffered: &mut BytesMut) -> Result<Option<Vec<u8>>> {
     if buffered.len() < 4 {
         return Ok(None);
     }
@@ -236,8 +256,8 @@ fn take_carrier_message(buffered: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
     if buffered.len() < 4 + length {
         return Ok(None);
     }
-    let message = buffered[4..4 + length].to_vec();
-    buffered.drain(..4 + length);
+    let encoded = buffered.split_to(4 + length);
+    let message = encoded[4..].to_vec();
     Ok(Some(message))
 }
 
@@ -257,6 +277,24 @@ impl Drop for MigrationRegistration {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let (config_path, check_only) = match arguments.as_slice() {
+        [] => ("/etc/rekaserdoba/server.json".to_owned(), false),
+        [argument] if argument == "--version" => {
+            println!(
+                "rekaserdoba-server {} {}",
+                env!("CARGO_PKG_VERSION"),
+                BUILD_SHA
+            );
+            return Ok(());
+        }
+        [argument] if argument == "--check-config" => {
+            ("/etc/rekaserdoba/server.json".to_owned(), true)
+        }
+        [argument] => (argument.clone(), false),
+        [argument, path] if argument == "--check-config" => (path.clone(), true),
+        _ => bail!("usage: rekaserdoba-server [--version|--check-config [path]|path]"),
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -266,12 +304,14 @@ async fn main() -> Result<()> {
         .compact()
         .init();
 
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/etc/rekaserdoba/server.json".to_owned());
     let raw =
         std::fs::read(&config_path).with_context(|| format!("read configuration {config_path}"))?;
     let cfg: Config = serde_json::from_slice(&raw).context("parse configuration")?;
+    let runtime = Arc::new(validate_config(&cfg)?);
+    if check_only {
+        println!("configuration valid");
+        return Ok(());
+    }
     let listen: SocketAddr = cfg.listen.parse().context("invalid listen address")?;
     let network = Network::create(&cfg.tun)?;
     let h3_endpoint = match cfg.h3.clone() {
@@ -279,34 +319,94 @@ async fn main() -> Result<()> {
         None => None,
     };
     drop_runtime_capabilities()?;
-    network.spawn_reader();
+    let (critical_sender, mut critical_receiver) = mpsc::channel::<String>(4);
+    let network_task = network.spawn_reader();
+    let network_failure = critical_sender.clone();
+    tokio::spawn(async move {
+        let reason = match network_task.await {
+            Ok(()) => "network reader stopped".to_owned(),
+            Err(error) => format!("network reader failed: {error}"),
+        };
+        let _ = network_failure.send(reason).await;
+    });
+    let h3_ready = Arc::new(AtomicBool::new(h3_endpoint.is_none()));
     let state = AppState {
-        runtime: Arc::new(Runtime::from_config(&cfg)?),
+        runtime,
         network,
         metrics: Arc::new(Metrics::default()),
+        draining: Arc::new(AtomicBool::new(false)),
+        h3_ready,
+        carriers: Arc::new(Semaphore::new(MAX_ACTIVE_CARRIERS)),
     };
     if let Some((endpoint, h3)) = h3_endpoint {
         let h3_state = state.clone();
+        let h3_failure = critical_sender.clone();
         tokio::spawn(async move {
             serve_h3_endpoint(endpoint, h3_state, h3).await;
+            let _ = h3_failure.send("H3 endpoint stopped".to_owned()).await;
         });
     }
+    drop(critical_sender);
 
     let app = Router::new()
         .route("/", get(decoy))
         .route("/healthz", get(health))
+        .route("/readyz", get(readiness))
         .route(H2_PATH, post(h2_tunnel))
         .fallback(get(maybe_tunnel))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    info!(%listen, "RekaSerdoba laboratory edge ready");
-    axum::serve(
+    let (shutdown_sender, mut shutdown_receiver) = watch::channel(false);
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown())
-    .await?;
+    .with_graceful_shutdown(async move {
+        loop {
+            if *shutdown_receiver.borrow() {
+                return;
+            }
+            if shutdown_receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    })
+    .into_future();
+    tokio::pin!(server);
+    info!(%listen, "RekaSerdoba edge ready");
+    let critical_failure = tokio::select! {
+        _ = shutdown() => None,
+        failure = critical_receiver.recv() => failure,
+        result = server.as_mut() => {
+            result?;
+            return Ok(());
+        }
+    };
+    state.draining.store(true, Ordering::Release);
+    state.h3_ready.store(false, Ordering::Release);
+    let _ = shutdown_sender.send(true);
+    let drain_deadline = Instant::now() + GRACEFUL_DRAIN_TIMEOUT;
+    let remaining = drain_deadline.saturating_duration_since(Instant::now());
+    match tokio::time::timeout(remaining, server.as_mut()).await {
+        Ok(result) => result?,
+        Err(_) => warn!(
+            sessions_active = state.metrics.sessions_active.load(Ordering::Relaxed),
+            "graceful drain timed out"
+        ),
+    }
+    while state.metrics.sessions_active.load(Ordering::Acquire) != 0
+        && Instant::now() < drain_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let active = state.metrics.sessions_active.load(Ordering::Relaxed);
+    if active != 0 {
+        warn!(sessions_active = active, "sessions remained after drain");
+    }
+    if let Some(failure) = critical_failure {
+        bail!("{failure}");
+    }
     Ok(())
 }
 
@@ -318,6 +418,48 @@ fn drop_runtime_capabilities() -> Result<()> {
     caps::clear(None, CapSet::Inheritable).context("clear inheritable capabilities")?;
     caps::clear(None, CapSet::Permitted).context("clear permitted capabilities")?;
     Ok(())
+}
+
+fn validate_config(cfg: &Config) -> Result<Runtime> {
+    let _: SocketAddr = cfg.listen.parse().context("invalid listen address")?;
+    Network::validate_settings(&cfg.tun)?;
+    if cfg.clients.len() > 4096 {
+        bail!("too many configured clients");
+    }
+    if let Some(h3) = &cfg.h3 {
+        let _: SocketAddr = h3.listen.parse().context("invalid H3 listen address")?;
+        if !h3.authority.ends_with(":443") || h3.authority.chars().any(char::is_whitespace) {
+            bail!("H3 authority must contain explicit :443 port");
+        }
+        if !h3.path.starts_with('/') || h3.path.len() > 256 {
+            bail!("invalid H3 path");
+        }
+        for (path, label) in [
+            (&h3.certificate_pem, "H3 certificate"),
+            (&h3.private_key_pem, "H3 private key"),
+        ] {
+            let metadata =
+                std::fs::metadata(path).with_context(|| format!("read {label} metadata"))?;
+            if !metadata.is_file() {
+                bail!("{label} is not a regular file");
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&h3.private_key_pem)?.permissions().mode();
+            if mode & 0o027 != 0 {
+                bail!("H3 private key permissions are too broad");
+            }
+        }
+        h3_edge::Server::validate(
+            Path::new(&h3.certificate_pem),
+            Path::new(&h3.private_key_pem),
+            Path::new(&h3.decoy_root),
+        )?;
+    }
+    Runtime::from_config(cfg)
 }
 
 fn build_h3_endpoint(cfg: &H3Config) -> Result<h3_edge::Server> {
@@ -335,7 +477,20 @@ fn build_h3_endpoint(cfg: &H3Config) -> Result<h3_edge::Server> {
     )
 }
 
+impl AppState {
+    fn is_operational(&self) -> bool {
+        !self.draining.load(Ordering::Acquire)
+            && self.network.is_ready()
+            && self.h3_ready.load(Ordering::Acquire)
+    }
+
+    fn is_accepting(&self) -> bool {
+        self.is_operational() && self.carriers.available_permits() != 0
+    }
+}
+
 async fn serve_h3_endpoint(endpoint: h3_edge::Server, state: AppState, cfg: H3Config) {
+    state.h3_ready.store(true, Ordering::Release);
     info!(listen = %cfg.listen, "RekaSerdoba H3 edge ready");
     let (sender, mut sessions) = mpsc::channel(128);
     tokio::spawn(endpoint.serve(sender));
@@ -350,6 +505,7 @@ async fn serve_h3_endpoint(endpoint: h3_edge::Server, state: AppState, cfg: H3Co
             }
         });
     }
+    state.h3_ready.store(false, Ordering::Release);
 }
 
 async fn handle_h3_session(
@@ -357,6 +513,9 @@ async fn handle_h3_session(
     state: AppState,
     cfg: H3Config,
 ) -> Result<()> {
+    if !state.is_operational() {
+        return Ok(());
+    }
     let peer = session.peer();
     if state.runtime.check_admission_rate(peer).is_err() {
         state.metrics.gate_rejected.fetch_add(1, Ordering::Relaxed);
@@ -369,7 +528,7 @@ async fn handle_h3_session(
         .map_err(|_| anyhow!("H3 TLS exporter unavailable"))?;
     let mut carrier = Carrier::H3(H3Carrier {
         session,
-        buffered: Vec::new(),
+        buffered: BytesMut::new(),
         application_ready: false,
     });
     let token = match tokio::time::timeout(Duration::from_secs(10), recv_binary(&mut carrier)).await
@@ -410,10 +569,14 @@ fn h3_exporter_context(authority: &str, path: &str) -> [u8; 32] {
 
 impl Runtime {
     fn from_config(cfg: &Config) -> Result<Self> {
-        if !cfg.authority.ends_with(":443") {
+        Network::validate_settings(&cfg.tun)?;
+        if !cfg.authority.ends_with(":443")
+            || cfg.authority.chars().any(char::is_whitespace)
+            || cfg.authority.len() > 255
+        {
             bail!("authority must contain explicit :443 port");
         }
-        if !cfg.tunnel_path.starts_with('/') {
+        if !cfg.tunnel_path.starts_with('/') || cfg.tunnel_path.len() > 256 {
             bail!("tunnel_path must start with /");
         }
         let seed = decode_fixed::<32>(&cfg.server_signing_seed_b64, "server signing seed")?;
@@ -423,11 +586,21 @@ impl Runtime {
             server_signing.verifying_key().as_bytes(),
         );
         let mut clients = HashMap::new();
+        let mut configured_ids = std::collections::HashSet::new();
+        let mut tunnel_addresses = std::collections::HashSet::new();
+        let server_ip: Ipv4Addr = cfg
+            .tun
+            .address
+            .parse()
+            .context("invalid TUN IPv4 address")?;
+        let mask = u32::MAX << (32 - cfg.tun.prefix_len);
+        let network = u32::from(server_ip) & mask;
+        let broadcast = network | !mask;
         for item in &cfg.clients {
-            if item.revoked {
-                continue;
-            }
             let id = decode_fixed::<16>(&item.client_id_b64, "client id")?;
+            if !configured_ids.insert(id) {
+                bail!("duplicate client id");
+            }
             let public_bytes =
                 decode_fixed::<32>(&item.client_public_key_b64, "client public key")?;
             let public_key =
@@ -437,23 +610,38 @@ impl Runtime {
             let IpAddr::V4(ip) = ip else {
                 bail!("tunnel_ipv4 must be IPv4")
             };
-            if clients
-                .insert(
-                    id,
-                    Client {
-                        id,
-                        public_key,
-                        gate_key,
-                        tunnel_ipv4: ip.octets(),
-                        session_lifetime_seconds: item.session_lifetime_seconds,
-                        bandwidth_bytes_per_second: item.bandwidth_bytes_per_second,
-                        session_quota_bytes: item.session_quota_bytes,
-                    },
-                )
-                .is_some()
+            let numeric_ip = u32::from(ip);
+            if numeric_ip & mask != network
+                || numeric_ip == network
+                || numeric_ip == broadcast
+                || ip == server_ip
             {
-                bail!("duplicate client id");
+                bail!("client tunnel IPv4 is outside the usable TUN subnet");
             }
+            SessionPolicy::new(
+                item.session_lifetime_seconds,
+                item.bandwidth_bytes_per_second,
+                item.session_quota_bytes,
+                Instant::now(),
+            )?;
+            if item.revoked {
+                continue;
+            }
+            if !tunnel_addresses.insert(ip) {
+                bail!("duplicate active client tunnel IPv4");
+            }
+            clients.insert(
+                id,
+                Client {
+                    id,
+                    public_key,
+                    gate_key,
+                    tunnel_ipv4: ip.octets(),
+                    session_lifetime_seconds: item.session_lifetime_seconds,
+                    bandwidth_bytes_per_second: item.bandwidth_bytes_per_second,
+                    session_quota_bytes: item.session_quota_bytes,
+                },
+            );
         }
         Ok(Self {
             authority: cfg.authority.clone(),
@@ -474,12 +662,53 @@ async fn decoy() -> impl IntoResponse {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let body = format!(
-        "rekaserdoba_up 1\nrekaserdoba_gate_rejected_total {}\nrekaserdoba_handshake_failed_total {}\nrekaserdoba_sessions_total {}\nrekaserdoba_sessions_active {}\nrekaserdoba_migrations_total {}\n",
+        "rekaserdoba_up 1\nrekaserdoba_build_info{{version=\"{}\",commit=\"{}\"}} 1\nrekaserdoba_gate_rejected_total {}\nrekaserdoba_handshake_failed_total {}\nrekaserdoba_sessions_total {}\nrekaserdoba_sessions_active {}\nrekaserdoba_sessions_by_carrier_total{{carrier=\"wss\"}} {}\nrekaserdoba_sessions_by_carrier_total{{carrier=\"h2\"}} {}\nrekaserdoba_sessions_by_carrier_total{{carrier=\"h3\"}} {}\nrekaserdoba_migrations_total {}\nrekaserdoba_migration_failed_total {}\nrekaserdoba_rekeys_total{{kind=\"routine\"}} {}\nrekaserdoba_rekeys_total{{kind=\"full\"}} {}\nrekaserdoba_rekey_failed_total {}\nrekaserdoba_overloaded_total {}\nrekaserdoba_disconnects_expected_total {}\nrekaserdoba_disconnects_error_total {}\nrekaserdoba_handshake_duration_seconds_sum {:.6}\nrekaserdoba_handshake_duration_seconds_count {}\nrekaserdoba_shaping_delay_seconds_total {:.6}\nrekaserdoba_network_ready {}\nrekaserdoba_h3_ready {}\nrekaserdoba_draining {}\nrekaserdoba_carrier_permits_available {}\nrekaserdoba_network_received_packets_total {}\nrekaserdoba_network_routed_packets_total {}\nrekaserdoba_network_unrouted_packets_total {}\nrekaserdoba_network_invalid_packets_total {}\nrekaserdoba_network_dropped_packets_total {}\n",
+        env!("CARGO_PKG_VERSION"),
+        BUILD_SHA,
         state.metrics.gate_rejected.load(Ordering::Relaxed),
         state.metrics.handshake_failed.load(Ordering::Relaxed),
         state.metrics.sessions_total.load(Ordering::Relaxed),
         state.metrics.sessions_active.load(Ordering::Relaxed),
+        state.metrics.wss_sessions_total.load(Ordering::Relaxed),
+        state.metrics.h2_sessions_total.load(Ordering::Relaxed),
+        state.metrics.h3_sessions_total.load(Ordering::Relaxed),
         state.metrics.migrations_total.load(Ordering::Relaxed),
+        state.metrics.migration_failed_total.load(Ordering::Relaxed),
+        state.metrics.routine_rekeys_total.load(Ordering::Relaxed),
+        state.metrics.full_rekeys_total.load(Ordering::Relaxed),
+        state.metrics.rekey_failed_total.load(Ordering::Relaxed),
+        state.metrics.overloaded_total.load(Ordering::Relaxed),
+        state
+            .metrics
+            .disconnects_expected_total
+            .load(Ordering::Relaxed),
+        state
+            .metrics
+            .disconnects_error_total
+            .load(Ordering::Relaxed),
+        state
+            .metrics
+            .handshake_duration_micros_total
+            .load(Ordering::Relaxed) as f64
+            / 1_000_000.0,
+        state
+            .metrics
+            .handshake_attempts_total
+            .load(Ordering::Relaxed),
+        state
+            .metrics
+            .shaping_delay_micros_total
+            .load(Ordering::Relaxed) as f64
+            / 1_000_000.0,
+        u8::from(state.network.is_ready()),
+        u8::from(state.h3_ready.load(Ordering::Acquire)),
+        u8::from(state.draining.load(Ordering::Acquire)),
+        state.carriers.available_permits(),
+        state.network.received_packets(),
+        state.network.routed_packets(),
+        state.network.unrouted_packets(),
+        state.network.invalid_packets(),
+        state.network.dropped_packets(),
     );
     (
         StatusCode::OK,
@@ -487,6 +716,20 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             ("cache-control", "no-store"),
             ("content-type", "text/plain; version=0.0.4"),
         ],
+        body,
+    )
+}
+
+async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
+    let ready = state.is_accepting();
+    let body = if ready { "ready\n" } else { "not ready\n" };
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        [("cache-control", "no-store")],
         body,
     )
 }
@@ -499,7 +742,7 @@ async fn maybe_tunnel(
     uri: axum::http::Uri,
 ) -> Response {
     let path = uri.path();
-    if path != state.runtime.tunnel_path {
+    if path != state.runtime.tunnel_path || !state.is_operational() {
         return ordinary_not_found();
     }
     let Ok(upgrade) = upgrade else {
@@ -556,6 +799,9 @@ async fn h2_tunnel(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if !state.is_operational() {
+        return ordinary_not_found();
+    }
     let Some(auth) = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -587,7 +833,7 @@ async fn h2_tunnel(
     let carrier = Carrier::H2(H2Carrier {
         input: body.into_data_stream(),
         output,
-        buffered: Vec::new(),
+        buffered: BytesMut::new(),
     });
     match admission {
         Admission::Handshake(client) => {
@@ -800,15 +1046,26 @@ impl Runtime {
 }
 
 fn forwarded_source(headers: &HeaderMap, fallback: IpAddr) -> IpAddr {
+    if !fallback.is_loopback() {
+        return fallback;
+    }
     headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.rsplit(',').next())
+        .and_then(|value| value.split(',').next())
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(fallback)
 }
 
 impl Carrier {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::WebSocket(_) => "wss",
+            Self::H2(_) => "h2",
+            Self::H3(_) => "h3",
+        }
+    }
+
     async fn recv(&mut self) -> Result<CarrierEvent> {
         match self {
             Self::WebSocket(socket) => match socket.recv().await {
@@ -926,14 +1183,45 @@ async fn send_h3_stream_message(stream: &mut H3Carrier, payload: &[u8]) -> Resul
 }
 
 async fn serve_session(mut carrier: Carrier, state: AppState, client: Client, peer: IpAddr) {
+    let Ok(_carrier_permit) = state.carriers.clone().try_acquire_owned() else {
+        state
+            .metrics
+            .overloaded_total
+            .fetch_add(1, Ordering::Relaxed);
+        carrier.close().await;
+        return;
+    };
+    if state.draining.load(Ordering::Acquire) {
+        carrier.close().await;
+        return;
+    }
+    let carrier_kind = carrier.kind();
+    let handshake_started = Instant::now();
+    state
+        .metrics
+        .handshake_attempts_total
+        .fetch_add(1, Ordering::Relaxed);
     let outcome = tokio::time::timeout(
         Duration::from_secs(10),
         inner_handshake(&mut carrier, &state.runtime, &client),
     )
     .await;
+    state.metrics.handshake_duration_micros_total.fetch_add(
+        handshake_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
     match outcome {
         Ok(Ok(mut established)) => {
             state.metrics.sessions_total.fetch_add(1, Ordering::Relaxed);
+            match carrier_kind {
+                "wss" => &state.metrics.wss_sessions_total,
+                "h2" => &state.metrics.h2_sessions_total,
+                _ => &state.metrics.h3_sessions_total,
+            }
+            .fetch_add(1, Ordering::Relaxed);
             state
                 .metrics
                 .sessions_active
@@ -964,7 +1252,20 @@ async fn serve_session(mut carrier: Carrier, state: AppState, client: Client, pe
             )
             .await
             {
-                warn!(reason = %error, "established session closed");
+                let (code, expected) = disconnect_reason(&error);
+                if expected {
+                    state
+                        .metrics
+                        .disconnects_expected_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    info!(code, reason = %error, "session closed");
+                } else {
+                    state
+                        .metrics
+                        .disconnects_error_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(code, reason = %error, "session failed");
+                }
             }
         }
         Ok(Err(error)) => {
@@ -983,6 +1284,26 @@ async fn serve_session(mut carrier: Carrier, state: AppState, client: Client, pe
         }
     }
     carrier.close().await;
+}
+
+fn disconnect_reason(error: &anyhow::Error) -> (&'static str, bool) {
+    let reason = error.to_string().to_ascii_lowercase();
+    if reason.contains("lifetime expired") {
+        ("session_lifetime", true)
+    } else if reason.contains("quota exceeded") {
+        ("session_quota", true)
+    } else if reason.contains("carrier closed")
+        || reason.contains("connection reset")
+        || reason.contains("broken pipe")
+    {
+        ("peer_closed", true)
+    } else if reason.contains("already has an active session") {
+        ("duplicate_session", true)
+    } else if reason.contains("timed out") || reason.contains("timeout") {
+        ("transport_timeout", true)
+    } else {
+        ("protocol_error", false)
+    }
 }
 
 async fn submit_migration(carrier: Carrier, sender: mpsc::Sender<MigrationCandidate>) {
@@ -1019,7 +1340,17 @@ async fn run_established_session(
             message = carrier.recv() => {
                 match message? {
                     CarrierEvent::Binary(encoded) => {
-                        if !process_record(carrier, network, runtime, session, client, &encoded).await? {
+                        if !process_record(
+                            carrier,
+                            network,
+                            runtime,
+                            session,
+                            client,
+                            &encoded,
+                            metrics,
+                        )
+                        .await?
+                        {
                             return Ok(());
                         }
                     }
@@ -1043,6 +1374,7 @@ async fn run_established_session(
                             session,
                             client,
                             &encoded,
+                            metrics,
                         )
                         .await?
                         {
@@ -1066,7 +1398,7 @@ async fn run_established_session(
                 let Some(packet) = packet else {
                     return Ok(());
                 };
-                session.policy.charge(packet.len(), Instant::now())?;
+                shape_traffic(&mut session.policy, packet.len(), metrics).await?;
                 send_outbound_packet(carrier, session, packet).await?;
             }
             migration = migrations.recv() => {
@@ -1088,6 +1420,9 @@ async fn run_established_session(
                         info!("session carrier migrated");
                     }
                     Err(error) => {
+                        metrics
+                            .migration_failed_total
+                            .fetch_add(1, Ordering::Relaxed);
                         warn!(reason = %error, "migration path validation failed");
                         migration.carrier.close().await;
                     }
@@ -1095,6 +1430,7 @@ async fn run_established_session(
             }
         }
         if let Some(record) = session.crypto.request_update_if_due(Instant::now())? {
+            metrics.routine_rekeys_total.fetch_add(1, Ordering::Relaxed);
             carrier.send_binary(record).await?;
         }
         update_check.as_mut().reset(tokio::time::Instant::from_std(
@@ -1321,6 +1657,7 @@ async fn process_record(
     session: &mut EstablishedSession,
     client: &Client,
     encoded: &[u8],
+    metrics: &Metrics,
 ) -> Result<bool> {
     let opened = session.crypto.open(encoded, Instant::now())?;
     match opened.header.kind {
@@ -1330,7 +1667,7 @@ async fn process_record(
                 if frame.frame_type == 0x03 {
                     if let Some(packet) = session.fragments.push(&frame.body, Instant::now())? {
                         validate_ipv4_packet(&packet, client.tunnel_ipv4)?;
-                        session.policy.charge(packet.len(), Instant::now())?;
+                        shape_traffic(&mut session.policy, packet.len(), metrics).await?;
                         network.send_to_kernel(&packet).await?;
                     }
                     continue;
@@ -1341,7 +1678,7 @@ async fn process_record(
                     carrier.send_binary(record).await?;
                 }
                 if frame.frame_type == 0x01 {
-                    session.policy.charge(frame.body.len(), Instant::now())?;
+                    shape_traffic(&mut session.policy, frame.body.len(), metrics).await?;
                     network.send_to_kernel(&frame.body).await?;
                 }
             }
@@ -1372,45 +1709,55 @@ async fn process_record(
                         if opened.position != EpochPosition::Current || frame.flags != 0 {
                             bail!("invalid key update init epoch or flags");
                         }
-                        let record = session.crypto.accept_update_init(
-                            encoded,
-                            &frame.body,
-                            Instant::now(),
-                        )?;
+                        let record = session
+                            .crypto
+                            .accept_update_init(encoded, &frame.body, Instant::now())
+                            .inspect_err(|_| {
+                                metrics.rekey_failed_total.fetch_add(1, Ordering::Relaxed);
+                            })?;
+                        metrics.routine_rekeys_total.fetch_add(1, Ordering::Relaxed);
                         carrier.send_binary(record).await?;
                     }
                     0x07 => {
                         if opened.position != EpochPosition::Pending || frame.flags != 0 {
                             bail!("invalid key update commit epoch or flags");
                         }
-                        let record = session.crypto.accept_update_commit(
-                            encoded,
-                            &frame.body,
-                            Instant::now(),
-                        )?;
+                        let record = session
+                            .crypto
+                            .accept_update_commit(encoded, &frame.body, Instant::now())
+                            .inspect_err(|_| {
+                                metrics.rekey_failed_total.fetch_add(1, Ordering::Relaxed);
+                            })?;
                         carrier.send_binary(record).await?;
                     }
                     0x09 => {
                         if opened.position != EpochPosition::Current || frame.flags != 0 {
                             bail!("invalid full rekey init epoch or flags");
                         }
-                        let record = session.crypto.accept_full_rekey_init(
-                            encoded,
-                            &frame.body,
-                            &client.public_key,
-                            &runtime.server_signing,
-                        )?;
+                        let record = session
+                            .crypto
+                            .accept_full_rekey_init(
+                                encoded,
+                                &frame.body,
+                                &client.public_key,
+                                &runtime.server_signing,
+                            )
+                            .inspect_err(|_| {
+                                metrics.rekey_failed_total.fetch_add(1, Ordering::Relaxed);
+                            })?;
+                        metrics.full_rekeys_total.fetch_add(1, Ordering::Relaxed);
                         carrier.send_binary(record).await?;
                     }
                     0x0B => {
                         if opened.position != EpochPosition::Pending || frame.flags != 0 {
                             bail!("invalid full rekey confirmation epoch or flags");
                         }
-                        let record = session.crypto.accept_full_rekey_confirm(
-                            encoded,
-                            &frame.body,
-                            Instant::now(),
-                        )?;
+                        let record = session
+                            .crypto
+                            .accept_full_rekey_confirm(encoded, &frame.body, Instant::now())
+                            .inspect_err(|_| {
+                                metrics.rekey_failed_total.fetch_add(1, Ordering::Relaxed);
+                            })?;
                         carrier.send_binary(record).await?;
                     }
                     0x12 => return Ok(false),
@@ -1420,6 +1767,18 @@ async fn process_record(
             Ok(true)
         }
     }
+}
+
+async fn shape_traffic(policy: &mut SessionPolicy, bytes: usize, metrics: &Metrics) -> Result<()> {
+    let delay = policy.reserve(bytes, Instant::now())?;
+    if !delay.is_zero() {
+        metrics.shaping_delay_micros_total.fetch_add(
+            delay.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        tokio::time::sleep(delay).await;
+    }
+    Ok(())
 }
 
 fn validate_data_frame(frame: &Frame, client: &Client) -> Result<Option<Frame>> {
@@ -1859,6 +2218,40 @@ async fn shutdown() {
 mod tests {
     use super::*;
 
+    fn client_config(id: u8, ip: &str) -> ClientConfig {
+        let signing = SigningKey::from_bytes(&[id.wrapping_add(1); 32]);
+        ClientConfig {
+            client_id_b64: URL_SAFE_NO_PAD.encode([id; 16]),
+            client_public_key_b64: URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes()),
+            gate_key_b64: URL_SAFE_NO_PAD.encode([id.wrapping_add(2); 32]),
+            tunnel_ipv4: ip.to_owned(),
+            revoked: false,
+            session_lifetime_seconds: 3600,
+            bandwidth_bytes_per_second: 1024 * 1024,
+            session_quota_bytes: 0,
+        }
+    }
+
+    fn test_config(clients: Vec<ClientConfig>) -> Config {
+        Config {
+            listen: "127.0.0.1:9080".to_owned(),
+            authority: "vpn.example:443".to_owned(),
+            tunnel_path: "/connect".to_owned(),
+            server_signing_seed_b64: URL_SAFE_NO_PAD.encode([9u8; 32]),
+            tun: TunSettings {
+                name: "reka0".to_owned(),
+                address: "10.77.0.1".to_owned(),
+                prefix_len: 24,
+                mtu: 1280,
+                session_queue: 64,
+                helper_socket: None,
+                helper_client_socket: None,
+            },
+            clients,
+            h3: None,
+        }
+    }
+
     #[test]
     fn nonce_xors_packet_number_into_low_64_bits() {
         let iv = [0x55u8; 12];
@@ -1894,7 +2287,7 @@ mod tests {
 
     #[test]
     fn carrier_framing_handles_fragmented_and_coalesced_messages() {
-        let mut buffered = vec![0, 0, 0, 3, 1, 2];
+        let mut buffered = BytesMut::from(&[0, 0, 0, 3, 1, 2][..]);
         assert!(take_carrier_message(&mut buffered).unwrap().is_none());
         buffered.extend_from_slice(&[3, 0, 0, 0, 2, 4, 5]);
         assert_eq!(
@@ -1910,8 +2303,80 @@ mod tests {
 
     #[test]
     fn carrier_framing_rejects_invalid_lengths() {
-        assert!(take_carrier_message(&mut vec![0, 0, 0, 0]).is_err());
-        let mut oversized = (MAX_CARRIER_MESSAGE as u32 + 1).to_be_bytes().to_vec();
+        assert!(take_carrier_message(&mut BytesMut::from(&[0, 0, 0, 0][..])).is_err());
+        let mut oversized = BytesMut::from(&(MAX_CARRIER_MESSAGE as u32 + 1).to_be_bytes()[..]);
         assert!(take_carrier_message(&mut oversized).is_err());
+    }
+
+    #[test]
+    fn carrier_framing_survives_random_chunk_boundaries() {
+        let messages = (0..128)
+            .map(|index| vec![index as u8; index % 97 + 1])
+            .collect::<Vec<_>>();
+        let mut encoded = Vec::new();
+        for message in &messages {
+            encoded.extend_from_slice(&(message.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(message);
+        }
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut offset = 0;
+        let mut buffered = BytesMut::new();
+        let mut decoded = Vec::new();
+        while offset < encoded.len() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let length = (state as usize % 31 + 1).min(encoded.len() - offset);
+            buffered.extend_from_slice(&encoded[offset..offset + length]);
+            offset += length;
+            while let Some(message) = take_carrier_message(&mut buffered).unwrap() {
+                decoded.push(message);
+            }
+        }
+        assert_eq!(decoded, messages);
+        assert!(buffered.is_empty());
+    }
+
+    #[test]
+    fn configuration_rejects_duplicate_tunnel_addresses() {
+        let cfg = test_config(vec![
+            client_config(1, "10.77.0.2"),
+            client_config(2, "10.77.0.2"),
+        ]);
+        assert!(Runtime::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn configuration_rejects_unusable_tunnel_addresses() {
+        for address in ["10.77.0.0", "10.77.0.1", "10.77.0.255", "10.78.0.2"] {
+            let cfg = test_config(vec![client_config(1, address)]);
+            assert!(Runtime::from_config(&cfg).is_err(), "{address}");
+        }
+    }
+
+    #[test]
+    fn configuration_accepts_distinct_clients_in_subnet() {
+        let cfg = test_config(vec![
+            client_config(1, "10.77.0.2"),
+            client_config(2, "10.77.0.3"),
+        ]);
+        assert_eq!(Runtime::from_config(&cfg).unwrap().clients.len(), 2);
+    }
+
+    #[test]
+    fn forwarded_source_is_only_trusted_from_loopback_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.8, 127.0.0.1".parse().unwrap(),
+        );
+        assert_eq!(
+            forwarded_source(&headers, "127.0.0.1".parse().unwrap()),
+            "198.51.100.8".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            forwarded_source(&headers, "203.0.113.9".parse().unwrap()),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
     }
 }

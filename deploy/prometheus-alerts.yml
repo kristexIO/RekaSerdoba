@@ -1,0 +1,38 @@
+groups:
+  - name: rekaserdoba
+    rules:
+      - alert: RekaSerdobaDown
+        expr: absent(rekaserdoba_up) or rekaserdoba_up != 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: RekaSerdoba edge is unavailable
+      - alert: RekaSerdobaNetworkNotReady
+        expr: rekaserdoba_network_ready != 1 or rekaserdoba_h3_ready != 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: RekaSerdoba carrier or network helper is not ready
+      - alert: RekaSerdobaPacketDrops
+        expr: rate(rekaserdoba_network_dropped_packets_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: RekaSerdoba drops packets
+      - alert: RekaSerdobaHandshakeFailures
+        expr: rate(rekaserdoba_handshake_failed_total[10m]) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: RekaSerdoba has sustained authenticated handshake failures
+      - alert: RekaSerdobaOverloaded
+        expr: increase(rekaserdoba_overloaded_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: RekaSerdoba rejected carriers because the concurrency limit was reached

@@ -1,18 +1,19 @@
 [Unit]
 Description=RekaSerdoba laboratory protocol edge
 After=network-online.target rekaserdoba-net-helper.service
-Wants=network-online.target
-Requires=rekaserdoba-net-helper.service
-BindsTo=rekaserdoba-net-helper.service
+Wants=network-online.target rekaserdoba-net-helper.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=rekaserdoba
 Group=rekaserdoba
+ExecStartPre=/opt/rekaserdoba/bin/rekaserdoba-server --check-config /etc/rekaserdoba/server.json
 ExecStart=/opt/rekaserdoba/bin/rekaserdoba-server /etc/rekaserdoba/server.json
-Restart=always
+Restart=on-failure
 RestartSec=3s
-TimeoutStopSec=15s
+TimeoutStopSec=20s
 Environment=RUST_LOG=rekaserdoba_server=info
 LimitNOFILE=65536
 TasksMax=256
