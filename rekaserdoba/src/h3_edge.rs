@@ -16,7 +16,7 @@ use http::{Method, Request, Response, StatusCode};
 use quinn::{Endpoint, TransportConfig, VarInt, crypto::rustls::QuicServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{Semaphore, mpsc};
-use tracing::warn;
+use tracing::{info, warn};
 
 type Http3RequestStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 type WebTransportConnection = WebTransportSession<h3_quinn::Connection, Bytes>;
@@ -287,7 +287,11 @@ async fn serve_session_requests(session: Arc<WebTransportConnection>, decoy_root
             }
             Ok(None) => return,
             Err(error) => {
-                warn!(reason = %error, "H3 session request loop failed");
+                if error.to_string().to_ascii_lowercase().contains("closed") {
+                    info!(reason = %error, "H3 session request loop closed");
+                } else {
+                    warn!(reason = %error, "H3 session request loop failed");
+                }
                 return;
             }
         }

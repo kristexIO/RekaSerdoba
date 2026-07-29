@@ -1295,6 +1295,7 @@ fn disconnect_reason(error: &anyhow::Error) -> (&'static str, bool) {
     } else if reason.contains("carrier closed")
         || reason.contains("connection reset")
         || reason.contains("broken pipe")
+        || reason.contains("error reading a body from connection")
     {
         ("peer_closed", true)
     } else if reason.contains("already has an active session") {
