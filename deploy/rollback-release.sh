@@ -28,4 +28,6 @@ sysctl --system >/dev/null
 systemctl daemon-reload
 systemctl restart rekaserdoba-net-helper.service
 systemctl restart rekaserdoba.service
+systemctl reset-failed rekaserdoba-health.service
+systemctl start rekaserdoba-health.service
 curl --retry 20 --retry-all-errors --retry-delay 1 --fail --silent --show-error --max-time 3 http://127.0.0.1:9080/readyz >/dev/null

@@ -74,6 +74,8 @@ systemctl daemon-reload
 systemctl restart rekaserdoba-net-helper.service
 systemctl restart rekaserdoba.service
 systemctl enable --now rekaserdoba-health.timer
+systemctl reset-failed rekaserdoba-health.service
+systemctl start rekaserdoba-health.service
 
 deadline=$((SECONDS + 30))
 until curl --fail --silent --show-error --max-time 3 http://127.0.0.1:9080/readyz >/dev/null; do
