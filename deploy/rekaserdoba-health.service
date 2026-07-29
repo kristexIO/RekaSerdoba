@@ -4,7 +4,7 @@ After=rekaserdoba.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/libexec/rekaserdoba-health-check
+ExecStart=/bin/bash /usr/local/libexec/rekaserdoba-health-check
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
