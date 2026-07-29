@@ -71,6 +71,9 @@ jobs:
   security:
     name: Supply chain and secrets
     runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - run: python3 rekaserdoba/tools/check_repository_secrets.py .
