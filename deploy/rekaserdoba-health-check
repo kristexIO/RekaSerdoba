@@ -1,0 +1,9 @@
+set -euo pipefail
+
+config=/etc/rekaserdoba/server.json
+curl --fail --silent --show-error --max-time 5 http://127.0.0.1:9080/readyz >/dev/null
+certificate=$(jq -er '.h3.certificate_pem' "$config")
+openssl x509 -checkend 604800 -noout -in "$certificate"
+systemctl is-active --quiet rekaserdoba.service
+systemctl is-active --quiet rekaserdoba-net-helper.service
+systemctl is-active --quiet caddy.service

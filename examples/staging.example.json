@@ -1,0 +1,21 @@
+{
+  "environment": "staging",
+  "domain": "staging-vpn.example.com",
+  "public_interface": "ens3",
+  "tunnel_network": "10.177.0.0/24",
+  "tunnel_interface": "reka-stg0",
+  "tcp_ports": [
+    443
+  ],
+  "udp_ports": [
+    443
+  ],
+  "release_gate": {
+    "require_wss": true,
+    "require_h2": true,
+    "require_h3": true,
+    "require_migration": true,
+    "require_helper_restart": true,
+    "require_rollback": true
+  }
+}

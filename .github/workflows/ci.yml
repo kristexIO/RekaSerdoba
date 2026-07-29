@@ -16,22 +16,36 @@ jobs:
       run:
         working-directory: rekaserdoba
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rekaserdoba
       - run: cargo fmt --check
       - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: REKASERDOBA_BUILD_SHA="$GITHUB_SHA" cargo build --locked --release --bin rekaserdoba-server --bin net_helper --bin h3_bridge
+      - run: python3 tools/generate_sbom.py Cargo.lock target/release/rekaserdoba-server.cdx.json --version 0.2.0 --commit "$GITHUB_SHA"
+      - run: |
+          cd target/release
+          install -m 0755 net_helper rekaserdoba-net-helper
+          sha256sum rekaserdoba-server rekaserdoba-net-helper h3_bridge rekaserdoba-server.cdx.json > SHA256SUMS
+          tar -czf rekaserdoba-linux-x86_64.tar.gz rekaserdoba-server rekaserdoba-net-helper h3_bridge rekaserdoba-server.cdx.json SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rekaserdoba-linux-x86_64
+          path: rekaserdoba/target/release/rekaserdoba-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
 
   protocol-tools:
     name: Protocol tools
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -45,11 +59,24 @@ jobs:
     name: Windows client
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: python -m pip install cryptography==49.0.0 h2==4.3.0
       - run: python -m unittest -v windows-client\test_client.py
         env:
           PYTHONPATH: ${{ github.workspace }}\windows-client;${{ github.workspace }}
+
+  security:
+    name: Supply chain and secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 rekaserdoba/tools/check_repository_secrets.py .
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: rekaserdoba
+      - run: bash -n deploy/*.sh deploy/rekaserdoba-health-check
+      - run: git diff --check

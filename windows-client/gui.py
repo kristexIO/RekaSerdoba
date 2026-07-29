@@ -6,6 +6,7 @@ import time
 import tkinter as tk
 from pathlib import Path
 
+from version import VERSION
 
 BG = "#111416"
 SIDEBAR = "#171b1e"
@@ -23,6 +24,7 @@ ROOT = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / SERVICE
 LOG_PATH = ROOT / "service.log"
 POLICY_STATE = ROOT / "network-policy.json"
 SETTINGS = ROOT / "settings.json"
+STATUS = ROOT / "status.json"
 
 
 def rounded(canvas, coordinates, radius, **options):
@@ -68,11 +70,13 @@ def service_status():
         return "missing"
     if "RUNNING" in result.stdout:
         try:
-            state = json.loads(POLICY_STATE.read_text(encoding="utf-8"))
-            active = state.get("active") is True
+            state = json.loads(STATUS.read_text(encoding="utf-8"))
+            fresh = int(time.time()) - int(state.get("updated_at", 0)) < 30
+            current = state.get("state")
         except (OSError, ValueError, TypeError):
-            active = False
-        return "connected" if active else "connecting"
+            fresh = False
+            current = None
+        return "connected" if fresh and current == "connected" else "connecting"
     return "stopped"
 
 
@@ -135,7 +139,7 @@ class RekaGui:
         self.sidebar_spacer.pack(fill="both", expand=True)
         tk.Label(
             self.sidebar,
-            text="0.1",
+            text=VERSION,
             bg=SIDEBAR,
             fg="#59636a",
             font=("Segoe UI", 8),
@@ -599,12 +603,11 @@ class RekaGui:
         else:
             status, color = "●  Отключено", MUTED
         self.header_state.configure(text=status, fg=color)
-        log = read_log()
-        transport = "Ожидание"
-        for line in reversed(log.splitlines()):
-            if "carrier connected name=" in line:
-                transport = line.rsplit("carrier connected name=", 1)[1].strip().upper()
-                break
+        try:
+            runtime = json.loads(STATUS.read_text(encoding="utf-8"))
+            transport = str(runtime.get("carrier", "Ожидание")).upper()
+        except (OSError, ValueError, TypeError):
+            transport = "Ожидание"
         self.transport_value.set(transport)
         self.draw_connection()
         if self.page == "logs":

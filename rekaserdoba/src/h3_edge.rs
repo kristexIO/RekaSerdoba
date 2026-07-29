@@ -1,5 +1,4 @@
 use std::{
-    io::BufReader,
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -16,12 +15,15 @@ use h3_webtransport::{
 use http::{Method, Request, Response, StatusCode};
 use quinn::{Endpoint, TransportConfig, VarInt, crypto::rustls::QuicServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::sync::mpsc;
-use tracing::warn;
+use tokio::sync::{Semaphore, mpsc};
+use tracing::{info, warn};
 
 type Http3RequestStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 type WebTransportConnection = WebTransportSession<h3_quinn::Connection, Bytes>;
 type WebTransportStream = WebTransportBidiStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+const MAX_H3_CONNECTIONS: usize = 256;
+const MAX_H3_DECOY_REQUESTS: usize = 64;
+const MAX_DECOY_FILE_SIZE: u64 = 1024 * 1024;
 
 pub struct Server {
     endpoint: Endpoint,
@@ -52,26 +54,7 @@ impl Server {
         private_key: &Path,
         decoy_root: &Path,
     ) -> Result<Self> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let certificate_file = std::fs::File::open(certificate)
-            .with_context(|| format!("open H3 certificate {}", certificate.display()))?;
-        let certificates = rustls_pemfile::certs(&mut BufReader::new(certificate_file))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("parse H3 certificate")?;
-        if certificates.is_empty() {
-            bail!("H3 certificate chain is empty");
-        }
-        let private_key_file = std::fs::File::open(private_key)
-            .with_context(|| format!("open H3 private key {}", private_key.display()))?;
-        let key = rustls_pemfile::private_key(&mut BufReader::new(private_key_file))
-            .context("parse H3 private key")?
-            .context("H3 private key is missing")?;
-        let mut tls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certificates, key)
-            .context("configure H3 certificate")?;
-        tls.alpn_protocols = vec![b"h3".to_vec()];
-        tls.max_early_data_size = 0;
+        let tls = load_tls_config(certificate, private_key)?;
         let crypto = QuicServerConfig::try_from(tls).context("configure H3 QUIC TLS")?;
         let mut transport = TransportConfig::default();
         transport.max_concurrent_bidi_streams(VarInt::from_u32(64));
@@ -91,7 +74,18 @@ impl Server {
         })
     }
 
+    pub fn validate(certificate: &Path, private_key: &Path, decoy_root: &Path) -> Result<()> {
+        load_tls_config(certificate, private_key)?;
+        let metadata = std::fs::metadata(decoy_root).context("read H3 decoy root metadata")?;
+        if !metadata.is_dir() {
+            bail!("H3 decoy root is not a directory");
+        }
+        std::fs::canonicalize(decoy_root).context("resolve H3 decoy root")?;
+        Ok(())
+    }
+
     pub async fn serve(self, sessions: mpsc::Sender<Session>) {
+        let connections = Arc::new(Semaphore::new(MAX_H3_CONNECTIONS));
         while let Some(incoming) = self.endpoint.accept().await {
             if !incoming.remote_address_validated() {
                 if let Err(error) = incoming.retry() {
@@ -103,7 +97,11 @@ impl Server {
             let path = self.path.clone();
             let decoy_root = self.decoy_root.clone();
             let sessions = sessions.clone();
+            let Ok(permit) = connections.clone().acquire_owned().await else {
+                return;
+            };
             tokio::spawn(async move {
+                let _permit = permit;
                 match accept_connection(incoming, &authority, &path, decoy_root).await {
                     Ok(Some(session)) => {
                         if let Err(error) = sessions.send(session).await {
@@ -117,6 +115,28 @@ impl Server {
             });
         }
     }
+}
+
+fn load_tls_config(certificate: &Path, private_key: &Path) -> Result<rustls::ServerConfig> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certificates = CertificateDer::pem_file_iter(certificate)
+        .with_context(|| format!("open H3 certificate {}", certificate.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("parse H3 certificate")?;
+    if certificates.is_empty() {
+        bail!("H3 certificate chain is empty");
+    }
+    let key = PrivateKeyDer::from_pem_file(private_key)
+        .with_context(|| format!("parse H3 private key {}", private_key.display()))?;
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)
+        .context("configure H3 certificate")?;
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.max_early_data_size = 0;
+    Ok(tls)
 }
 
 impl Session {
@@ -247,11 +267,16 @@ async fn accept_reliable_stream(
 }
 
 async fn serve_session_requests(session: Arc<WebTransportConnection>, decoy_root: Arc<PathBuf>) {
+    let requests = Arc::new(Semaphore::new(MAX_H3_DECOY_REQUESTS));
     loop {
         match session.accept_bi().await {
             Ok(Some(AcceptedBi::Request(request, stream))) => {
                 let root = decoy_root.clone();
+                let Ok(permit) = requests.clone().acquire_owned().await else {
+                    return;
+                };
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(error) = serve_decoy_request(request, stream, root).await {
                         warn!(reason = %error, "H3 decoy request failed");
                     }
@@ -262,7 +287,11 @@ async fn serve_session_requests(session: Arc<WebTransportConnection>, decoy_root
             }
             Ok(None) => return,
             Err(error) => {
-                warn!(reason = %error, "H3 session request loop failed");
+                if error.to_string().to_ascii_lowercase().contains("closed") {
+                    info!(reason = %error, "H3 session request loop closed");
+                } else {
+                    warn!(reason = %error, "H3 session request loop failed");
+                }
                 return;
             }
         }
@@ -362,6 +391,14 @@ async fn read_decoy_file(root: &Path, request_path: &str) -> Result<Option<(Byte
     } else {
         canonical
     };
+    let canonical = match tokio::fs::canonicalize(&canonical).await {
+        Ok(value) if value.starts_with(root) => value,
+        _ => return Ok(None),
+    };
+    let metadata = tokio::fs::metadata(&canonical).await?;
+    if !metadata.is_file() || metadata.len() > MAX_DECOY_FILE_SIZE {
+        return Ok(None);
+    }
     let body = match tokio::fs::read(&canonical).await {
         Ok(value) => Bytes::from(value),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

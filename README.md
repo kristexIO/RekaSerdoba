@@ -137,8 +137,8 @@ sequenceDiagram
 
 ```text
 Carriers                 ████████████████████  3 / 3
-Rust protocol tests      ████████████████████  23 passing
-Windows client tests     ████████████████████  11 passing
+Rust protocol tests      ████████████████████  28 passing
+Windows client tests     ████████████████████  14 passing
 External crypto audit    ░░░░░░░░░░░░░░░░░░░░  pending
 24h fuzz / chaos soak    ░░░░░░░░░░░░░░░░░░░░  pending
 ```

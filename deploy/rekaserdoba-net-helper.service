@@ -12,6 +12,7 @@ Restart=always
 RestartSec=3s
 RuntimeDirectory=rekaserdoba
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 
 NoNewPrivileges=true
 PrivateDevices=false

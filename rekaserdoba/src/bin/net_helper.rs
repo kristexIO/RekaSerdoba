@@ -1,4 +1,5 @@
 use std::{
+    io::ErrorKind,
     net::Ipv4Addr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -42,10 +43,14 @@ async fn main() -> Result<()> {
             received = device.recv(&mut tun_buffer) => {
                 let length = received.context("read helper TUN")?;
                 if edge_registered {
-                    socket
-                        .send_to(&tun_buffer[..length], &client_path)
-                        .await
-                        .context("send packet to edge")?;
+                    match socket.send_to(&tun_buffer[..length], &client_path).await {
+                        Ok(written) if written == length => {}
+                        Ok(_) => bail!("partial packet send to edge"),
+                        Err(error) if edge_unavailable(&error) => {
+                            edge_registered = false;
+                        }
+                        Err(error) => return Err(error).context("send packet to edge"),
+                    }
                 }
             }
             received = socket.recv_from(&mut edge_buffer) => {
@@ -55,6 +60,16 @@ async fn main() -> Result<()> {
                 }
                 if &edge_buffer[..length] == b"RSN1" {
                     edge_registered = true;
+                    match socket.send_to(b"RSA1", &client_path).await {
+                        Ok(4) => {}
+                        Ok(_) => bail!("partial registration acknowledgement"),
+                        Err(error) if edge_unavailable(&error) => {
+                            edge_registered = false;
+                        }
+                        Err(error) => {
+                            return Err(error).context("send registration acknowledgement");
+                        }
+                    }
                     continue;
                 }
                 if !edge_registered
@@ -72,6 +87,13 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+fn edge_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::NotFound | ErrorKind::ConnectionRefused
+    )
 }
 
 fn remove_socket(path: &Path) -> Result<()> {

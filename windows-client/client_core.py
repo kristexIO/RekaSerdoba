@@ -174,6 +174,16 @@ class CarrierScores:
         }
         self._save()
 
+    def wait_seconds(self, name, now=None):
+        now = time.time() if now is None else now
+        cooldown = float(self.values.get(name, {}).get("cooldown", 0))
+        return max(0, cooldown - now)
+
+    def next_retry_seconds(self, choices, now=None):
+        waits = [self.wait_seconds(choice.name, now) for choice in choices]
+        positive = [value for value in waits if value > 0]
+        return min(positive) if positive else 1
+
     def failure(self, name):
         entry = self.values.get(name, {})
         failures = min(int(entry.get("failures", 0)) + 1, 8)
