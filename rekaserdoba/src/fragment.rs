@@ -28,6 +28,12 @@ struct ParsedFragment<'a> {
     data: &'a [u8],
 }
 
+impl Default for FragmentReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FragmentReassembler {
     pub fn new() -> Self {
         Self {

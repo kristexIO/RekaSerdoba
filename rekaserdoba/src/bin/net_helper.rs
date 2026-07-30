@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use tokio::net::UnixDatagram;
-use tun_rs::DeviceBuilder;
+use tun::Configuration;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,12 +24,14 @@ async fn main() -> Result<()> {
     if name.is_empty() || name.len() > 15 || prefix > 32 || !(576..=9000).contains(&mtu) {
         bail!("invalid network helper configuration");
     }
-    let device = DeviceBuilder::new()
-        .name(name)
-        .ipv4(address, prefix, None)
+    let mut configuration = Configuration::default();
+    configuration
+        .tun_name(name)
+        .address(address)
+        .netmask(Ipv4Addr::from(prefix_mask(prefix)))
         .mtu(mtu)
-        .build_async()
-        .context("create helper TUN")?;
+        .up();
+    let device = tun::create_as_async(&configuration).context("create helper TUN")?;
     remove_socket(&server_path)?;
     let socket = UnixDatagram::bind(&server_path).context("bind helper socket")?;
     std::fs::set_permissions(&server_path, std::fs::Permissions::from_mode(0o660))?;

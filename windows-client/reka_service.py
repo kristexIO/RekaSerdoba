@@ -42,7 +42,7 @@ SETTINGS = ROOT / "settings.json"
 STATUS = ROOT / "status.json"
 
 
-def write_status(state, carrier=None, reason=None):
+def write_status(state, carrier=None, reason=None, endpoint=None):
     ROOT.mkdir(parents=True, exist_ok=True)
     value = {
         "version": VERSION,
@@ -53,6 +53,8 @@ def write_status(state, carrier=None, reason=None):
         value["carrier"] = carrier
     if reason:
         value["reason"] = reason
+    if endpoint:
+        value["endpoint"] = endpoint
     temporary = STATUS.with_suffix(".new")
     temporary.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
     os.replace(temporary, STATUS)
@@ -165,7 +167,8 @@ class TunnelRuntime:
         mode = transport_mode()
         choices = select_transport_choices(choices, mode)
         logging.info("transport mode=%s", mode)
-        endpoint_ip = addresses[0]
+        if not addresses:
+            raise ValueError("manifest has no endpoint addresses")
         self.runtime_bundle = self._materialize_bundle(bundle)
         if self.use_tun:
             dll = Path(sys.executable).resolve().parent / "wintun.dll"
@@ -185,14 +188,18 @@ class TunnelRuntime:
         try:
             while not self.stop_event.is_set():
                 attempted = False
-                for choice in scores.order(choices):
+                for endpoint_ip, choice in scores.order_candidates(addresses, choices):
                     if self.stop_event.is_set():
                         break
-                    if scores.wait_seconds(choice.name) > 0:
+                    if scores.wait_seconds(
+                        choice.name, endpoint=endpoint_ip
+                    ) > 0:
                         continue
                     attempted = True
                     try:
-                        write_status("connecting", choice.name)
+                        write_status(
+                            "connecting", choice.name, endpoint=endpoint_ip
+                        )
                         if self.policy:
                             self.policy.prepare(endpoint_ip)
                             logging.info(
@@ -210,17 +217,29 @@ class TunnelRuntime:
                             server_public,
                             bridge if bridge.exists() else None,
                         )
-                        scores.success(choice.name)
+                        scores.success(choice.name, endpoint_ip)
                         self.carrier_name = choice.name
-                        write_status("connected", choice.name)
-                        logging.info("carrier connected name=%s", choice.name)
+                        write_status(
+                            "connected", choice.name, endpoint=endpoint_ip
+                        )
+                        logging.info(
+                            "carrier connected name=%s address=%s",
+                            choice.name,
+                            endpoint_ip,
+                        )
                         self._pump(endpoint_ip)
                     except Exception as error:
-                        scores.failure(choice.name)
-                        write_status("reconnecting", choice.name, type(error).__name__)
-                        logging.warning(
-                            "carrier failed name=%s reason=%r",
+                        scores.failure(choice.name, endpoint_ip)
+                        write_status(
+                            "reconnecting",
                             choice.name,
+                            type(error).__name__,
+                            endpoint_ip,
+                        )
+                        logging.warning(
+                            "carrier failed name=%s address=%s reason=%r",
+                            choice.name,
+                            endpoint_ip,
                             error,
                         )
                     finally:
@@ -234,7 +253,13 @@ class TunnelRuntime:
                             self.session = None
                         self.carrier_name = None
                 if not self.stop_event.is_set():
-                    delay = 2 if attempted else scores.next_retry_seconds(choices)
+                    delay = (
+                        2
+                        if attempted
+                        else scores.next_retry_seconds(
+                            choices, endpoints=addresses
+                        )
+                    )
                     self.stop_event.wait(min(max(delay, 1), 30))
         finally:
             write_status("stopped")
@@ -310,7 +335,11 @@ class TunnelRuntime:
                     self.session.send_keepalive()
                     keepalive = time.monotonic() + 15
                 if time.monotonic() >= status_heartbeat:
-                    write_status("connected", self.carrier_name)
+                    write_status(
+                        "connected",
+                        self.carrier_name,
+                        endpoint=endpoint_ip,
+                    )
                     status_heartbeat = time.monotonic() + 10
             if not failure.empty():
                 raise failure.get()
@@ -395,23 +424,25 @@ def connection_check():
         if not bridge.exists():
             bridge = Path(__file__).resolve().parent / "h3_bridge.exe"
         results = {}
-        for choice in choices:
-            try:
-                session = RekaSession.connect(
-                    runtime,
-                    choice,
-                    host,
-                    port,
-                    addresses[0],
-                    server_public,
-                    bridge if bridge.exists() else None,
-                )
-                session.send_keepalive()
-                session.receive()
-                session.close()
-                results[choice.name] = "ok"
-            except Exception as error:
-                results[choice.name] = type(error).__name__
+        for address in addresses:
+            for choice in choices:
+                key = f"{address}/{choice.name}"
+                try:
+                    session = RekaSession.connect(
+                        runtime,
+                        choice,
+                        host,
+                        port,
+                        address,
+                        server_public,
+                        bridge if bridge.exists() else None,
+                    )
+                    session.send_keepalive()
+                    session.receive()
+                    session.close()
+                    results[key] = "ok"
+                except Exception as error:
+                    results[key] = type(error).__name__
         print(json.dumps(results, sort_keys=True))
         if not any(value == "ok" for value in results.values()):
             raise SystemExit(1)

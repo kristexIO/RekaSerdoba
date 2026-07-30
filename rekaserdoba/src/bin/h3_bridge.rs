@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -132,7 +132,7 @@ fn gate_token(
     message.extend_from_slice(client_id);
     message.extend_from_slice(&unix_time.to_be_bytes());
     message.extend_from_slice(&nonce);
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(gate_key)?;
+    let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(gate_key)?;
     mac.update(&message);
     let mut token = Vec::with_capacity(72);
     token.extend_from_slice(client_id);

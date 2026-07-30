@@ -144,6 +144,23 @@ class ClientTests(unittest.TestCase):
             self.assertGreater(scores.wait_seconds("h3"), 0)
             self.assertGreater(scores.next_retry_seconds(choices), 0)
 
+    def test_endpoint_failure_rotates_address(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            scores = CarrierScores(Path(temporary) / "scores.json")
+            choices = [CarrierChoice("h3", "/h3", "CONNECT", 10)]
+            addresses = ["192.0.2.10", "192.0.2.11"]
+            scores.failure("h3", addresses[0])
+            ordered = scores.order_candidates(addresses, choices)
+            self.assertEqual(ordered[0][0], addresses[1])
+            self.assertGreater(
+                scores.wait_seconds("h3", endpoint=addresses[0]),
+                0,
+            )
+            self.assertEqual(
+                scores.wait_seconds("h3", endpoint=addresses[1]),
+                0,
+            )
+
     def test_diagnostics_excludes_secrets_and_redacts_logs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

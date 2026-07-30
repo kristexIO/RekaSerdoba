@@ -30,7 +30,7 @@ use chacha20poly1305::{
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -41,18 +41,16 @@ use tracing::{info, warn};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-mod fragment;
 mod h3_edge;
 mod network;
-mod record;
-mod rekey;
-mod session;
 
-use fragment::FragmentReassembler;
 use network::{Network, TunSettings};
-use record::{ApplicationSecrets, Frame, RecordKind, parse_frames};
-use rekey::{EpochPosition, RekeySession};
-use session::SessionPolicy;
+use rekaserdoba_server::{
+    fragment::FragmentReassembler,
+    record::{ApplicationSecrets, Frame, RecordKind, parse_frames},
+    rekey::{EpochPosition, RekeySession},
+    session::SessionPolicy,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 type GateReplayKey = ([u8; 16], [u8; 16]);
@@ -948,7 +946,7 @@ impl Runtime {
         message.extend_from_slice(&client_id);
         message.extend_from_slice(&unix_time.to_be_bytes());
         message.extend_from_slice(&nonce);
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(&client.gate_key)?;
+        let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(&client.gate_key)?;
         mac.update(&message);
         let expected = mac.finalize().into_bytes();
         if expected.as_slice().ct_eq(&received_mac).unwrap_u8() != 1 {
@@ -999,7 +997,7 @@ impl Runtime {
         message.extend_from_slice(&unix_time.to_be_bytes());
         message.extend_from_slice(&nonce);
         message.extend_from_slice(&endpoint_id.to_be_bytes());
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(entry.secret.as_ref().as_ref())?;
+        let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(entry.secret.as_ref().as_ref())?;
         mac.update(&message);
         let expected = mac.finalize().into_bytes();
         if expected.as_slice().ct_eq(&received_mac).unwrap_u8() != 1 {
@@ -2111,7 +2109,7 @@ fn hash_parts(parts: &[&[u8]]) -> [u8; 32] {
 }
 
 fn hmac_bytes(key: &[u8], message: &[u8]) -> Result<[u8; 32]> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key)?;
+    let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(key)?;
     mac.update(message);
     Ok(mac.finalize().into_bytes().into())
 }

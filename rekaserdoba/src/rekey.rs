@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -614,7 +614,8 @@ fn hmac_label(key: &[u8], label: &[u8], context: &[u8]) -> Result<[u8; 32]> {
 }
 
 fn hmac_bytes(key: &[u8], message: &[u8]) -> Result<[u8; 32]> {
-    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| anyhow!("invalid HMAC key"))?;
+    let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(key)
+        .map_err(|_| anyhow!("invalid HMAC key"))?;
     mac.update(message);
     Ok(mac.finalize().into_bytes().into())
 }
