@@ -282,7 +282,7 @@ class TunnelRuntime:
             self.session.send_keepalive()
             self.session.receive()
             return
-        work = queue.Queue(maxsize=4096)
+        outbound = queue.Queue(maxsize=4096)
         failure = queue.Queue(maxsize=1)
         pump_stop = threading.Event()
         traffic = {
@@ -299,7 +299,7 @@ class TunnelRuntime:
                     if packet and _valid_ipv4_packet(
                         packet, self.session.parameters.ipv4
                     ):
-                        work.put((True, packet), timeout=1)
+                        outbound.put(packet, timeout=1)
             except Exception as error:
                 _put_failure(failure, error)
 
@@ -308,7 +308,9 @@ class TunnelRuntime:
                 while not self.stop_event.is_set() and not pump_stop.is_set():
                     packets = self.session.receive()
                     for packet in packets or []:
-                        work.put((False, packet), timeout=1)
+                        self.adapter.send(packet)
+                        traffic["rx_packets"] += 1
+                        traffic["rx_bytes"] += len(packet)
             except Exception as error:
                 _put_failure(failure, error)
 
@@ -329,15 +331,10 @@ class TunnelRuntime:
                 and not self.session.expired()
             ):
                 try:
-                    outbound, packet = work.get(timeout=0.25)
-                    if outbound:
-                        self.session.send_packet(packet)
-                        traffic["tx_packets"] += 1
-                        traffic["tx_bytes"] += len(packet)
-                    else:
-                        self.adapter.send(packet)
-                        traffic["rx_packets"] += 1
-                        traffic["rx_bytes"] += len(packet)
+                    packet = outbound.get(timeout=0.25)
+                    self.session.send_packet(packet)
+                    traffic["tx_packets"] += 1
+                    traffic["tx_bytes"] += len(packet)
                 except queue.Empty:
                     pass
                 if time.monotonic() >= keepalive:
