@@ -73,15 +73,13 @@ jobs:
   security:
     name: Supply chain and secrets
     runs-on: ubuntu-latest
-    permissions:
-      checks: write
-      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: python3 rekaserdoba/tools/check_repository_secrets.py .
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+      - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: rekaserdoba
+          tool: cargo-audit@0.22.2
+      - run: cargo audit --deny warnings
+        working-directory: rekaserdoba
       - run: bash -n deploy/*.sh deploy/rekaserdoba-health-check deploy/rekaserdoba-maintenance
       - run: git diff --check
