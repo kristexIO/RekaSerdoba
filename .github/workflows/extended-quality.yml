@@ -28,7 +28,7 @@ jobs:
       - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e
         with:
           tool: cargo-llvm-cov
-      - run: cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 40
+      - run: cargo llvm-cov --locked --lib --summary-only --fail-under-lines 70
 
   fuzz:
     name: Record parser fuzz
@@ -41,7 +41,7 @@ jobs:
       - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e
         with:
           tool: cargo-fuzz
-      - run: cargo fuzz run record_frames --manifest-path rekaserdoba/fuzz/Cargo.toml -- -max_total_time=30 -rss_limit_mb=2048
+      - run: cd rekaserdoba/fuzz && cargo fuzz run record_frames -- -max_total_time=30 -rss_limit_mb=2048
 
   benchmark:
     name: Protocol benchmark
