@@ -8,7 +8,7 @@
 - создаёт Wintun adapter `RekaSerdoba`;
 - добавляет endpoint exception до default routes;
 - включает endpoint route и два IPv4 tunnel routes только после успешного рукопожатия;
-- передаёт IPv4 packets через надёжный H3/WebTransport stream либо H2/WSS framing;
+- передаёт H3 data records через WebTransport datagrams, H3 control records через надёжный stream, а резервные соединения через H2/WSS framing;
 - автоматически снимает tunnel routes при остановке или аварии транспорта;
 - не меняет глобальную outbound-политику Windows Firewall.
 
