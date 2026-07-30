@@ -185,13 +185,6 @@ impl Session {
         Ok(())
     }
 
-    pub fn send_datagram(&self, value: Bytes) -> Result<()> {
-        self.webtransport
-            .datagram_sender()
-            .send_datagram(value)
-            .map_err(|error| anyhow!("send H3 datagram: {error:?}"))
-    }
-
     pub async fn close(&mut self) {
         let _ = self.send.shutdown().await;
         self.connection

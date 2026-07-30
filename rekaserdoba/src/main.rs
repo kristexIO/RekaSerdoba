@@ -71,7 +71,8 @@ const H3_EXPORTER_LABEL: &[u8] = b"EXPORTER-RekaSerdoba-gate";
 const BUILD_SHA: &str = env!("REKASERDOBA_BUILD_SHA");
 const MAX_ACTIVE_CARRIERS: usize = 1024;
 const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
-const H3_DATAGRAM_FRAGMENT_SIZE: usize = 900;
+const H2_BATCH_BYTES: usize = 64 * 1024;
+const H2_BATCH_INTERVAL: Duration = Duration::from_millis(2);
 
 const DECOY_HTML: &str = r#"<!doctype html>
 <html lang="ru">
@@ -227,7 +228,7 @@ enum Carrier {
 
 struct H2Carrier {
     input: BodyDataStream,
-    output: mpsc::Sender<Result<Bytes, Infallible>>,
+    output: mpsc::Sender<Bytes>,
     buffered: BytesMut,
 }
 
@@ -828,7 +829,7 @@ async fn h2_tunnel(
             }
         },
     };
-    let (output, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(64);
+    let (output, receiver) = mpsc::channel::<Bytes>(256);
     let carrier = Carrier::H2(H2Carrier {
         input: body.into_data_stream(),
         output,
@@ -846,8 +847,31 @@ async fn h2_tunnel(
         .status(StatusCode::OK)
         .header("cache-control", "no-store")
         .header("content-type", "application/octet-stream")
-        .body(Body::from_stream(ReceiverStream::new(receiver)))
+        .body(Body::from_stream(ReceiverStream::new(batch_h2_output(
+            receiver,
+        ))))
         .expect("streaming response")
+}
+
+fn batch_h2_output(mut input: mpsc::Receiver<Bytes>) -> mpsc::Receiver<Result<Bytes, Infallible>> {
+    let (output, receiver) = mpsc::channel(64);
+    tokio::spawn(async move {
+        while let Some(first) = input.recv().await {
+            let mut batch = BytesMut::with_capacity(H2_BATCH_BYTES);
+            batch.extend_from_slice(&first);
+            let deadline = tokio::time::Instant::now() + H2_BATCH_INTERVAL;
+            while batch.len() < H2_BATCH_BYTES {
+                match tokio::time::timeout_at(deadline, input.recv()).await {
+                    Ok(Some(next)) => batch.extend_from_slice(&next),
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            if output.send(Ok(batch.freeze())).await.is_err() {
+                return;
+            }
+        }
+    });
+    receiver
 }
 
 fn ordinary_not_found() -> Response {
@@ -1105,17 +1129,11 @@ impl Carrier {
                 encoded.extend_from_slice(&payload);
                 stream
                     .output
-                    .send(Ok(Bytes::from(encoded)))
+                    .send(Bytes::from(encoded))
                     .await
                     .map_err(|_| anyhow!("H2 carrier response closed"))?;
             }
-            Self::H3(stream) => {
-                if stream.application_ready && is_application_data_record(&payload) {
-                    stream.session.send_datagram(Bytes::from(payload))?;
-                } else {
-                    send_h3_stream_message(stream, &payload).await?;
-                }
-            }
+            Self::H3(stream) => send_h3_stream_message(stream, &payload).await?,
         }
         Ok(())
     }
@@ -1460,51 +1478,14 @@ async fn send_outbound_packet(
     session: &mut EstablishedSession,
     packet: Vec<u8>,
 ) -> Result<()> {
-    let datagrams = matches!(
-        carrier,
-        Carrier::H3(H3Carrier {
-            application_ready: true,
-            ..
-        })
-    );
-    for frame in outbound_frames(packet, datagrams, OsRng.next_u32())? {
-        let plaintext = frame.encode()?;
-        let record = session.crypto.seal_data(&plaintext, false)?;
-        carrier.send_binary(record).await?;
+    let plaintext = Frame {
+        frame_type: 0x01,
+        flags: 0,
+        body: packet,
     }
-    Ok(())
-}
-
-fn outbound_frames(packet: Vec<u8>, datagrams: bool, packet_id: u32) -> Result<Vec<Frame>> {
-    if !datagrams || packet.len() <= H3_DATAGRAM_FRAGMENT_SIZE {
-        return Ok(vec![Frame {
-            frame_type: 0x01,
-            flags: 0,
-            body: packet,
-        }]);
-    }
-    let total = u16::try_from(packet.len())?;
-    let mut frames = Vec::with_capacity(packet.len().div_ceil(H3_DATAGRAM_FRAGMENT_SIZE));
-    for (index, fragment) in packet.chunks(H3_DATAGRAM_FRAGMENT_SIZE).enumerate() {
-        let offset = u16::try_from(index * H3_DATAGRAM_FRAGMENT_SIZE)?;
-        let length = u16::try_from(fragment.len())?;
-        let mut body = Vec::with_capacity(10 + fragment.len());
-        body.extend_from_slice(&packet_id.to_be_bytes());
-        body.extend_from_slice(&total.to_be_bytes());
-        body.extend_from_slice(&offset.to_be_bytes());
-        body.extend_from_slice(&length.to_be_bytes());
-        body.extend_from_slice(fragment);
-        frames.push(Frame {
-            frame_type: 0x03,
-            flags: 0,
-            body,
-        });
-    }
-    Ok(frames)
-}
-
-fn is_application_data_record(payload: &[u8]) -> bool {
-    payload.len() >= 31 && payload[0] >> 4 == 1 && payload[0] & 0x09 == 0
+    .encode()?;
+    let record = session.crypto.seal_data(&plaintext, false)?;
+    carrier.send_binary(record).await
 }
 
 async fn validate_migration_path(
@@ -2349,6 +2330,20 @@ mod tests {
         assert!(take_carrier_message(&mut oversized).is_err());
     }
 
+    #[tokio::test]
+    async fn h2_output_coalesces_ready_records() {
+        let (sender, receiver) = mpsc::channel(4);
+        sender.send(Bytes::from_static(b"first")).await.unwrap();
+        sender.send(Bytes::from_static(b"second")).await.unwrap();
+        drop(sender);
+        let mut output = batch_h2_output(receiver);
+        assert_eq!(
+            output.recv().await.unwrap().unwrap(),
+            Bytes::from_static(b"firstsecond")
+        );
+        assert!(output.recv().await.is_none());
+    }
+
     #[test]
     fn carrier_framing_survives_random_chunk_boundaries() {
         let messages = (0..128)
@@ -2376,37 +2371,6 @@ mod tests {
         }
         assert_eq!(decoded, messages);
         assert!(buffered.is_empty());
-    }
-
-    #[test]
-    fn h3_datagram_frames_reassemble_full_mtu_packets() {
-        let packet = (0..1280).map(|index| index as u8).collect::<Vec<_>>();
-        let frames = outbound_frames(packet.clone(), true, 7).unwrap();
-        assert_eq!(frames.len(), 2);
-        assert!(frames.iter().all(|frame| {
-            frame.frame_type == 0x03
-                && frame.flags == 0
-                && frame.body.len() <= H3_DATAGRAM_FRAGMENT_SIZE + 10
-        }));
-        let now = Instant::now();
-        let mut reassembler = FragmentReassembler::new();
-        let mut restored = None;
-        for frame in frames {
-            if let Some(value) = reassembler.push(&frame.body, now).unwrap() {
-                restored = Some(value);
-            }
-        }
-        assert_eq!(restored, Some(packet));
-    }
-
-    #[test]
-    fn application_data_records_are_selected_for_datagrams() {
-        let mut data = vec![0u8; 31];
-        data[0] = 0x10;
-        assert!(is_application_data_record(&data));
-        data[0] = 0x18;
-        assert!(!is_application_data_record(&data));
-        assert!(!is_application_data_record(&data[..30]));
     }
 
     #[test]
