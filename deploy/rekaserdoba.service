@@ -11,7 +11,7 @@ User=rekaserdoba
 Group=rekaserdoba
 ExecStartPre=/opt/rekaserdoba/bin/rekaserdoba-server --check-config /etc/rekaserdoba/server.json
 ExecStart=/opt/rekaserdoba/bin/rekaserdoba-server /etc/rekaserdoba/server.json
-Restart=on-failure
+Restart=always
 RestartSec=3s
 TimeoutStopSec=20s
 Environment=RUST_LOG=rekaserdoba_server=info
