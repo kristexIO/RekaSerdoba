@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  linux:
+    name: Linux release
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rekaserdoba
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          workspaces: rekaserdoba
+      - run: test "${GITHUB_REF_NAME}" = "v$(sed -n 's/^version = \"\\([^\"]*\\)\"/\\1/p' Cargo.toml | head -n1)"
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: REKASERDOBA_BUILD_SHA="$GITHUB_SHA" cargo build --locked --release --bin rekaserdoba-server --bin net_helper --bin h3_bridge
+      - run: python3 tools/generate_sbom.py Cargo.lock target/release/rekaserdoba-server.cdx.json --version "${GITHUB_REF_NAME#v}" --commit "$GITHUB_SHA"
+      - run: |
+          cd target/release
+          install -m 0755 net_helper rekaserdoba-net-helper
+          sha256sum rekaserdoba-server rekaserdoba-net-helper h3_bridge rekaserdoba-server.cdx.json > SHA256SUMS
+          tar -czf rekaserdoba-linux-x86_64.tar.gz rekaserdoba-server rekaserdoba-net-helper h3_bridge rekaserdoba-server.cdx.json SHA256SUMS
+          sha256sum rekaserdoba-linux-x86_64.tar.gz > rekaserdoba-linux-x86_64.tar.gz.sha256
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: rekaserdoba/target/release/rekaserdoba-linux-x86_64.tar.gz
+      - run: gh release create "$GITHUB_REF_NAME" target/release/rekaserdoba-linux-x86_64.tar.gz target/release/rekaserdoba-linux-x86_64.tar.gz.sha256 target/release/rekaserdoba-server.cdx.json --verify-tag --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  windows-bridge:
+    name: Windows H3 bridge
+    needs: linux
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: rekaserdoba
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          workspaces: rekaserdoba
+      - run: cargo build --locked --release --bin h3_bridge
+      - shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 target\release\h3_bridge.exe).Hash.ToLowerInvariant()
+          "$hash  h3_bridge.exe" | Set-Content -Encoding ascii target\release\h3_bridge.exe.sha256
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: rekaserdoba/target/release/h3_bridge.exe
+      - shell: pwsh
+        run: gh release upload $env:GITHUB_REF_NAME target\release\h3_bridge.exe target\release\h3_bridge.exe.sha256
+        env:
+          GH_TOKEN: ${{ github.token }}

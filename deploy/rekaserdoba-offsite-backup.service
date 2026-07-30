@@ -1,0 +1,14 @@
+[Unit]
+Description=Encrypted RekaSerdoba offsite backup
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/rekaserdoba/offsite-backup
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/libexec/rekaserdoba-offsite-backup
+Nice=10
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/rekaserdoba

@@ -1,0 +1,166 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "panels": [
+    {
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "targets": [
+        {
+          "expr": "rekaserdoba_up",
+          "refId": "A"
+        }
+      ],
+      "title": "Edge up",
+      "type": "stat"
+    },
+    {
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "rekaserdoba_network_ready",
+          "refId": "A"
+        }
+      ],
+      "title": "Network ready",
+      "type": "stat"
+    },
+    {
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "rekaserdoba_h3_ready",
+          "refId": "A"
+        }
+      ],
+      "title": "H3 ready",
+      "type": "stat"
+    },
+    {
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "rekaserdoba_sessions_active",
+          "refId": "A"
+        }
+      ],
+      "title": "Active sessions",
+      "type": "stat"
+    },
+    {
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "id": 5,
+      "targets": [
+        {
+          "expr": "probe_success{job=\"public_https\"}",
+          "refId": "A"
+        }
+      ],
+      "title": "Public HTTPS",
+      "type": "stat"
+    },
+    {
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "id": 6,
+      "targets": [
+        {
+          "expr": "100 - rekaserdoba_root_filesystem_used_percent",
+          "refId": "A"
+        }
+      ],
+      "title": "Disk free percent",
+      "type": "stat"
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 7,
+      "targets": [
+        {
+          "expr": "rate(rekaserdoba_sessions_by_carrier_total[5m])",
+          "legendFormat": "{{carrier}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Sessions by carrier",
+      "type": "timeseries"
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 8,
+      "targets": [
+        {
+          "expr": "rate(rekaserdoba_disconnects_error_total[5m])",
+          "legendFormat": "disconnect errors",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(rekaserdoba_network_dropped_packets_total[5m])",
+          "legendFormat": "packet drops",
+          "refId": "B"
+        }
+      ],
+      "title": "Errors and drops",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 41,
+  "tags": [
+    "rekaserdoba"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "RekaSerdoba",
+  "uid": "rekaserdoba"
+}

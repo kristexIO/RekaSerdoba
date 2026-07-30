@@ -19,8 +19,11 @@ install -m 0644 deploy/rekaserdoba-net-helper.service "$output_dir/systemd/rekas
 install -m 0644 deploy/rekaserdoba-health.service "$output_dir/systemd/rekaserdoba-health.service"
 install -m 0644 deploy/rekaserdoba-health.timer "$output_dir/systemd/rekaserdoba-health.timer"
 install -m 0644 deploy/rekaserdoba-recover.service "$output_dir/systemd/rekaserdoba-recover.service"
+install -m 0644 deploy/rekaserdoba-maintenance.service "$output_dir/systemd/rekaserdoba-maintenance.service"
+install -m 0644 deploy/rekaserdoba-maintenance.timer "$output_dir/systemd/rekaserdoba-maintenance.timer"
 install -m 0644 deploy/60-rekaserdoba-sysctl.conf "$output_dir/sysctl/60-rekaserdoba.conf"
 install -m 0755 deploy/rekaserdoba-health-check "$output_dir/libexec/rekaserdoba-health-check"
+install -m 0755 deploy/rekaserdoba-maintenance "$output_dir/libexec/rekaserdoba-maintenance"
 printf '%s\n' "$commit" >"$output_dir/COMMIT"
 (
     cd "$output_dir"

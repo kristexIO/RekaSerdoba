@@ -16,7 +16,7 @@ use serde::Deserialize;
 use tokio::net::UnixDatagram;
 use tokio::sync::mpsc;
 use tracing::warn;
-use tun_rs::{AsyncDevice, DeviceBuilder};
+use tun::{AsyncDevice, Configuration};
 
 const HELPER_REGISTRATION: &[u8; 4] = b"RSN1";
 const HELPER_ACKNOWLEDGEMENT: &[u8; 4] = b"RSA1";
@@ -136,12 +136,14 @@ impl Network {
                 server_path,
             })
         } else {
-            let device = DeviceBuilder::new()
-                .name(&settings.name)
-                .ipv4(address, settings.prefix_len, None)
+            let mut configuration = Configuration::default();
+            configuration
+                .tun_name(&settings.name)
+                .address(address)
+                .netmask(Ipv4Addr::from(prefix_mask(settings.prefix_len)))
                 .mtu(settings.mtu)
-                .build_async()
-                .context("create TUN interface")?;
+                .up();
+            let device = tun::create_as_async(&configuration).context("create TUN interface")?;
             PacketDevice::Tun(device)
         };
         let ready = matches!(&device, PacketDevice::Tun(_));
@@ -408,6 +410,14 @@ fn ipv4_destination(packet: &[u8]) -> Option<[u8; 4]> {
         return None;
     }
     packet.get(16..20)?.try_into().ok()
+}
+
+fn prefix_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
 }
 
 #[cfg(test)]

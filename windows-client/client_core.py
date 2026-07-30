@@ -155,40 +155,88 @@ class CarrierScores:
         if path.exists():
             self.values = json.loads(path.read_text(encoding="utf-8"))
 
-    def order(self, choices):
+    @staticmethod
+    def _key(name, endpoint=None):
+        return f"{endpoint}/{name}" if endpoint else name
+
+    def order(self, choices, endpoint=None):
         now = time.time()
         return sorted(
             choices,
             key=lambda item: (
-                float(self.values.get(item.name, {}).get("cooldown", 0)) > now,
-                item.priority + int(self.values.get(item.name, {}).get("failures", 0)) * 10,
+                float(
+                    self.values.get(self._key(item.name, endpoint), {}).get(
+                        "cooldown", 0
+                    )
+                )
+                > now,
+                item.priority
+                + int(
+                    self.values.get(self._key(item.name, endpoint), {}).get(
+                        "failures", 0
+                    )
+                )
+                * 10,
             ),
         )
 
-    def success(self, name):
-        entry = self.values.get(name, {})
-        self.values[name] = {
+    def order_candidates(self, endpoints, choices):
+        now = time.time()
+        candidates = [
+            (endpoint, choice) for endpoint in endpoints for choice in choices
+        ]
+        return sorted(
+            candidates,
+            key=lambda item: (
+                float(
+                    self.values.get(self._key(item[1].name, item[0]), {}).get(
+                        "cooldown", 0
+                    )
+                )
+                > now,
+                item[1].priority
+                + int(
+                    self.values.get(self._key(item[1].name, item[0]), {}).get(
+                        "failures", 0
+                    )
+                )
+                * 10,
+            ),
+        )
+
+    def success(self, name, endpoint=None):
+        key = self._key(name, endpoint)
+        entry = self.values.get(key, {})
+        self.values[key] = {
             "failures": max(0, int(entry.get("failures", 0)) - 1),
             "cooldown": 0,
             "last_success": int(time.time()),
         }
         self._save()
 
-    def wait_seconds(self, name, now=None):
+    def wait_seconds(self, name, now=None, endpoint=None):
         now = time.time() if now is None else now
-        cooldown = float(self.values.get(name, {}).get("cooldown", 0))
+        cooldown = float(
+            self.values.get(self._key(name, endpoint), {}).get("cooldown", 0)
+        )
         return max(0, cooldown - now)
 
-    def next_retry_seconds(self, choices, now=None):
-        waits = [self.wait_seconds(choice.name, now) for choice in choices]
+    def next_retry_seconds(self, choices, now=None, endpoints=None):
+        endpoints = list(endpoints or [None])
+        waits = [
+            self.wait_seconds(choice.name, now, endpoint)
+            for endpoint in endpoints
+            for choice in choices
+        ]
         positive = [value for value in waits if value > 0]
         return min(positive) if positive else 1
 
-    def failure(self, name):
-        entry = self.values.get(name, {})
+    def failure(self, name, endpoint=None):
+        key = self._key(name, endpoint)
+        entry = self.values.get(key, {})
         failures = min(int(entry.get("failures", 0)) + 1, 8)
         delay = min(300, 2**failures) + int.from_bytes(os.urandom(1), "big") % 4
-        self.values[name] = {
+        self.values[key] = {
             "failures": failures,
             "cooldown": int(time.time()) + delay,
             "last_failure": int(time.time()),

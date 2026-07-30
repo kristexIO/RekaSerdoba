@@ -57,11 +57,11 @@ async fn main() -> Result<()> {
         body.extend_from_slice(&chunk.copy_to_bytes(remaining));
     }
     println!(
-        "status={} content_type={} bytes={} sha256={:x}",
+        "status={} content_type={} bytes={} sha256={}",
         status.as_u16(),
         content_type,
         body.len(),
-        Sha256::digest(&body)
+        encode_hex(&Sha256::digest(&body))
     );
     drop(stream);
     drop(requests);
@@ -69,4 +69,14 @@ async fn main() -> Result<()> {
     let _ = driver_task.await;
     endpoint.wait_idle().await;
     Ok(())
+}
+
+fn encode_hex(value: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value {
+        encoded.push(DIGITS[usize::from(byte >> 4)] as char);
+        encoded.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
 }

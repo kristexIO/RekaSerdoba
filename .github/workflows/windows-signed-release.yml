@@ -1,0 +1,129 @@
+name: Windows Signed Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: Encrypted artifact name
+        required: true
+        default: rekaserdoba-windows
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    name: Signed personalized installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          workspaces: rekaserdoba
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: rekaserdoba/tools/requirements.txt
+      - name: Validate secrets
+        shell: pwsh
+        env:
+          WINDOWS_CLIENT_BUNDLE_B64: ${{ secrets.WINDOWS_CLIENT_BUNDLE_B64 }}
+          WINDOWS_SIGNING_PFX_B64: ${{ secrets.WINDOWS_SIGNING_PFX_B64 }}
+          WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+          WINDOWS_RELEASE_PASSWORD: ${{ secrets.WINDOWS_RELEASE_PASSWORD }}
+        run: |
+          foreach ($name in "WINDOWS_CLIENT_BUNDLE_B64", "WINDOWS_SIGNING_PFX_B64", "WINDOWS_SIGNING_PASSWORD", "WINDOWS_RELEASE_PASSWORD") {
+            if ([string]::IsNullOrWhiteSpace((Get-Item "env:$name").Value)) {
+              throw "Required secret is unavailable: $name"
+            }
+          }
+      - name: Test Windows client
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -r rekaserdoba/tools/requirements.txt pywin32==311 h2==4.3.0
+          $env:PYTHONPATH = "$PWD;$PWD\windows-client"
+          python -m unittest discover -s windows-client -p "test_*.py" -v
+      - name: Build H3 bridge
+        shell: pwsh
+        run: |
+          cargo build --locked --release --manifest-path rekaserdoba/Cargo.toml --bin h3_bridge
+          Copy-Item rekaserdoba\target\release\h3_bridge.exe windows-client\h3_bridge.exe
+      - name: Obtain verified Wintun
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          $archiveHash = (Get-FileHash -Algorithm SHA256 wintun.zip).Hash.ToLowerInvariant()
+          if ($archiveHash -ne "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51") {
+            throw "Wintun archive checksum mismatch"
+          }
+          Expand-Archive wintun.zip -DestinationPath wintun
+          Copy-Item wintun\wintun\bin\amd64\wintun.dll windows-client\wintun.dll
+          $dllHash = (Get-FileHash -Algorithm SHA256 windows-client\wintun.dll).Hash.ToLowerInvariant()
+          if ($dllHash -ne "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce") {
+            throw "Wintun DLL checksum mismatch"
+          }
+      - name: Import signing material
+        id: certificate
+        shell: pwsh
+        env:
+          WINDOWS_CLIENT_BUNDLE_B64: ${{ secrets.WINDOWS_CLIENT_BUNDLE_B64 }}
+          WINDOWS_SIGNING_PFX_B64: ${{ secrets.WINDOWS_SIGNING_PFX_B64 }}
+          WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+        run: |
+          New-Item -ItemType Directory -Force .codex-temp | Out-Null
+          [IO.File]::WriteAllBytes("$PWD\.codex-temp\client-bundle.json", [Convert]::FromBase64String($env:WINDOWS_CLIENT_BUNDLE_B64))
+          [IO.File]::WriteAllBytes("$PWD\.codex-temp\signing.pfx", [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_B64))
+          $password = ConvertTo-SecureString $env:WINDOWS_SIGNING_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath .codex-temp\signing.pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password -Exportable:$false
+          if (-not $certificate.HasPrivateKey) {
+            throw "Signing certificate has no private key"
+          }
+          "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
+      - name: Build and sign installer
+        shell: pwsh
+        run: |
+          .\windows-client\build.ps1 -Bundle .codex-temp\client-bundle.json -SigningCertificateThumbprint "${{ steps.certificate.outputs.thumbprint }}"
+          foreach ($path in Get-ChildItem windows-client\dist\*.exe) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $path
+            if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Thumbprint -ne "${{ steps.certificate.outputs.thumbprint }}") {
+              throw "Invalid Authenticode signature: $path"
+            }
+          }
+      - name: Encrypt release
+        id: package
+        shell: pwsh
+        env:
+          WINDOWS_RELEASE_PASSWORD: ${{ secrets.WINDOWS_RELEASE_PASSWORD }}
+          RELEASE_NAME: ${{ inputs.release_name }}
+        run: |
+          $version = (Get-Content windows-client\version.py).Split('"')[1]
+          $artifact = "$env:RELEASE_NAME-$version.7z"
+          & 7z a -t7z -mx=9 -mhe=on "-p$env:WINDOWS_RELEASE_PASSWORD" $artifact .\windows-client\dist\*
+          if ($LASTEXITCODE -ne 0) {
+            throw "Encrypted archive creation failed"
+          }
+          "path=$artifact" >> $env:GITHUB_OUTPUT
+          "name=$env:RELEASE_NAME-$version" >> $env:GITHUB_OUTPUT
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: ${{ steps.package.outputs.path }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.path }}
+          retention-days: 1
+          if-no-files-found: error
+      - name: Remove signing material
+        if: always()
+        shell: pwsh
+        run: |
+          $thumbprint = "${{ steps.certificate.outputs.thumbprint }}"
+          if ($thumbprint) {
+            Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
+          }
+          Remove-Item -LiteralPath .codex-temp\signing.pfx -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath .codex-temp\client-bundle.json -Force -ErrorAction SilentlyContinue

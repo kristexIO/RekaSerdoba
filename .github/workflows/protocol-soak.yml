@@ -1,0 +1,52 @@
+name: Protocol Soak
+
+on:
+  schedule:
+    - cron: "47 2 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Test duration
+        required: true
+        default: "300"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-protocol-soak
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    name: Production protocol soak
+    runs-on: ubuntu-latest
+    env:
+      REKASERDOBA_SOAK_BUNDLE_B64: ${{ secrets.REKASERDOBA_SOAK_BUNDLE_B64 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          workspaces: rekaserdoba
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: rekaserdoba/tools/requirements.txt
+      - name: Skip when test identity is not configured
+        if: env.REKASERDOBA_SOAK_BUNDLE_B64 == ''
+        run: echo "REKASERDOBA_SOAK_BUNDLE_B64 is not configured"
+      - name: Build and test
+        if: env.REKASERDOBA_SOAK_BUNDLE_B64 != ''
+        env:
+          REQUESTED_DURATION: ${{ inputs.duration_seconds }}
+        run: |
+          python3 -m pip install --disable-pip-version-check -r rekaserdoba/tools/requirements.txt
+          cargo build --locked --release --manifest-path rekaserdoba/Cargo.toml --bin h3_bridge
+          printf '%s' "$REKASERDOBA_SOAK_BUNDLE_B64" | base64 -d >"$RUNNER_TEMP/soak-bundle.json"
+          duration=${REQUESTED_DURATION:-300}
+          bash deploy/protocol-soak.sh "$RUNNER_TEMP/soak-bundle.json" rekaserdoba/target/release/h3_bridge 31.56.188.92 "$duration" 5
+      - name: Remove test identity
+        if: always()
+        run: rm -f "$RUNNER_TEMP/soak-bundle.json"
