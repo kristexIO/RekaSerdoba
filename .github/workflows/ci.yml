@@ -82,4 +82,5 @@ jobs:
       - run: cargo audit --deny warnings
         working-directory: rekaserdoba
       - run: bash -n deploy/*.sh deploy/rekaserdoba-health-check deploy/rekaserdoba-maintenance
+      - run: grep -Fx 'Restart=always' deploy/rekaserdoba.service
       - run: git diff --check
