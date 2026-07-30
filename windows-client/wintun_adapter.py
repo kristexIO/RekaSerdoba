@@ -22,6 +22,16 @@ def guid(value):
     return Guid.from_buffer_copy(encoded)
 
 
+def open_or_create_adapter(dll, name, requested):
+    adapter = dll.WintunOpenAdapter(name)
+    if adapter:
+        return adapter
+    adapter = dll.WintunCreateAdapter(name, "RekaSerdoba", ctypes.byref(requested))
+    if adapter:
+        return adapter
+    raise ctypes.WinError(ctypes.get_last_error() or 31)
+
+
 class WintunAdapter:
     def __init__(self, dll_path, name="RekaSerdoba"):
         if os.name != "nt":
@@ -29,17 +39,18 @@ class WintunAdapter:
         self.dll = ctypes.WinDLL(str(Path(dll_path).resolve()), use_last_error=True)
         self._configure_api()
         requested = guid("7d1a2e5d-cd36-47d9-9931-274921ae4f41")
-        self.adapter = self.dll.WintunCreateAdapter(name, "RekaSerdoba", ctypes.byref(requested))
-        if not self.adapter:
-            raise ctypes.WinError()
+        self.adapter = open_or_create_adapter(self.dll, name, requested)
         self.session = self.dll.WintunStartSession(self.adapter, 0x400000)
         if not self.session:
             self.dll.WintunCloseAdapter(self.adapter)
-            raise ctypes.WinError()
+            self.adapter = None
+            raise ctypes.WinError(ctypes.get_last_error() or 31)
         self.event = self.dll.WintunGetReadWaitEvent(self.session)
         self.name = name
 
     def _configure_api(self):
+        self.dll.WintunOpenAdapter.argtypes = [wintypes.LPCWSTR]
+        self.dll.WintunOpenAdapter.restype = wintypes.HANDLE
         self.dll.WintunCreateAdapter.argtypes = [
             wintypes.LPCWSTR,
             wintypes.LPCWSTR,
