@@ -1,0 +1,10 @@
+[Unit]
+Description=RekaSerdoba storage and backup maintenance
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/libexec/rekaserdoba-maintenance
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

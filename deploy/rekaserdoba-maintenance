@@ -1,0 +1,43 @@
+set -euo pipefail
+
+exec 9>/run/rekaserdoba-maintenance.lock
+flock -n 9 || exit 0
+
+usage=$(df --output=pcent / | tail -n1 | tr -dc '0-9')
+if test "$usage" -ge 70 && ! pgrep -f 'cargo (build|check|test|clippy|bench|install)' >/dev/null; then
+    if test -f /root/rekaserdoba-src/Cargo.toml; then
+        /root/.cargo/bin/cargo clean --manifest-path /root/rekaserdoba-src/Cargo.toml
+    fi
+fi
+
+mapfile -t releases < <(find /root -mindepth 1 -maxdepth 1 -type d -name 'rekaserdoba-release-*' -printf '%T@ %p\n' | sort -nr | cut -d' ' -f2-)
+for ((index = 3; index < ${#releases[@]}; index++)); do
+    path=$(realpath "${releases[$index]}")
+    [[ "$path" =~ ^/root/rekaserdoba-release-[0-9a-f]+$ ]]
+    rm -rf -- "$path"
+done
+
+mapfile -t backups < <(find /var/backups/rekaserdoba -mindepth 1 -maxdepth 1 -type d -name '20??????T??????Z' -printf '%T@ %p\n' | sort -nr | cut -d' ' -f2-)
+for ((index = 10; index < ${#backups[@]}; index++)); do
+    path=$(realpath "${backups[$index]}")
+    [[ "$path" =~ ^/var/backups/rekaserdoba/20[0-9]{6}T[0-9]{6}Z$ ]]
+    test -f "$path/SHA256SUMS"
+    (
+        cd "$path"
+        sha256sum --check --strict SHA256SUMS >/dev/null
+    )
+    rm -rf -- "$path"
+done
+
+apt-get clean
+install -d -o prometheus -g prometheus -m 0755 /var/lib/prometheus/node-exporter
+latest=$(find /var/backups/rekaserdoba -mindepth 1 -maxdepth 1 -type d -name '20??????T??????Z' -printf '%T@\n' | sort -nr | head -n1)
+temporary=/var/lib/prometheus/node-exporter/rekaserdoba.prom.new
+{
+    printf 'rekaserdoba_root_filesystem_used_percent %s\n' "$usage"
+    printf 'rekaserdoba_backup_count %s\n' "${#backups[@]}"
+    printf 'rekaserdoba_backup_latest_timestamp_seconds %s\n' "${latest:-0}"
+} >"$temporary"
+chown prometheus:prometheus "$temporary"
+chmod 0644 "$temporary"
+mv -f "$temporary" /var/lib/prometheus/node-exporter/rekaserdoba.prom

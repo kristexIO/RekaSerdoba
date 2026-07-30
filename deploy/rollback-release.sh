@@ -20,12 +20,29 @@ install -m 0644 "$backup/systemd/rekaserdoba-net-helper.service" /etc/systemd/sy
 test ! -f "$backup/systemd/rekaserdoba-health.service" || install -m 0644 "$backup/systemd/rekaserdoba-health.service" /etc/systemd/system/rekaserdoba-health.service
 test ! -f "$backup/systemd/rekaserdoba-health.timer" || install -m 0644 "$backup/systemd/rekaserdoba-health.timer" /etc/systemd/system/rekaserdoba-health.timer
 test ! -f "$backup/systemd/rekaserdoba-recover.service" || install -m 0644 "$backup/systemd/rekaserdoba-recover.service" /etc/systemd/system/rekaserdoba-recover.service
+if test -f "$backup/systemd/rekaserdoba-maintenance.service"; then
+    install -m 0644 "$backup/systemd/rekaserdoba-maintenance.service" /etc/systemd/system/rekaserdoba-maintenance.service
+else
+    rm -f /etc/systemd/system/rekaserdoba-maintenance.service
+fi
+if test -f "$backup/systemd/rekaserdoba-maintenance.timer"; then
+    install -m 0644 "$backup/systemd/rekaserdoba-maintenance.timer" /etc/systemd/system/rekaserdoba-maintenance.timer
+else
+    systemctl disable --now rekaserdoba-maintenance.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/rekaserdoba-maintenance.timer
+fi
 install -d -o root -g root -m 0755 /usr/local/libexec
 test ! -f "$backup/libexec/rekaserdoba-health-check" || install -m 0755 "$backup/libexec/rekaserdoba-health-check" /usr/local/libexec/rekaserdoba-health-check
+if test -f "$backup/libexec/rekaserdoba-maintenance"; then
+    install -m 0755 "$backup/libexec/rekaserdoba-maintenance" /usr/local/libexec/rekaserdoba-maintenance
+else
+    rm -f /usr/local/libexec/rekaserdoba-maintenance
+fi
 test ! -f "$backup/sysctl/60-rekaserdoba.conf" || install -m 0644 "$backup/sysctl/60-rekaserdoba.conf" /etc/sysctl.d/60-rekaserdoba.conf
 /opt/rekaserdoba/bin/rekaserdoba-server --check-config /etc/rekaserdoba/server.json
 sysctl --system >/dev/null
 systemctl daemon-reload
+test ! -f "$backup/systemd/rekaserdoba-maintenance.timer" || systemctl enable --now rekaserdoba-maintenance.timer
 systemctl restart rekaserdoba-net-helper.service
 systemctl restart rekaserdoba.service
 systemctl reset-failed rekaserdoba-health.service
