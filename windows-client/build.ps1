@@ -89,10 +89,19 @@ Invoke-Sign -Paths @(
     --add-data "$(Join-Path $output 'reka-service.exe');." `
     --add-data "$(Join-Path $PSScriptRoot 'h3_bridge.exe');." `
     --add-data "$(Join-Path $PSScriptRoot 'wintun.dll');." `
-    --add-data "$Bundle;RekaSerdoba_client_bundle.json" `
+    --add-data "$Bundle;." `
     --add-data "$(Join-Path $PSScriptRoot 'WINTUN_LICENSE.txt');." `
     (Join-Path $PSScriptRoot "setup.py")
 Invoke-Sign -Paths @((Join-Path $output "RekaSerdoba_Setup.exe"))
+$setup = Join-Path $output "RekaSerdoba_Setup.exe"
+$selfTest = Start-Process -FilePath $setup -ArgumentList "--self-test" -WindowStyle Hidden -PassThru
+if (-not $selfTest.WaitForExit(60000)) {
+    & taskkill.exe /PID $selfTest.Id /T /F | Out-Null
+    throw "Installer self-test timed out"
+}
+if ($selfTest.ExitCode -ne 0) {
+    throw "Installer self-test failed with exit code $($selfTest.ExitCode)"
+}
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "h3_bridge.exe") -Destination $output
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "wintun.dll") -Destination $output
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install.ps1") -Destination $output
