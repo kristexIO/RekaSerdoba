@@ -16,24 +16,24 @@ jobs:
       run:
         working-directory: rekaserdoba
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           workspaces: rekaserdoba
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: REKASERDOBA_BUILD_SHA="$GITHUB_SHA" cargo build --locked --release --bin rekaserdoba-server --bin net_helper --bin h3_bridge
-      - run: python3 tools/generate_sbom.py Cargo.lock target/release/rekaserdoba-server.cdx.json --version 0.2.0 --commit "$GITHUB_SHA"
+      - run: python3 tools/generate_sbom.py Cargo.lock target/release/rekaserdoba-server.cdx.json --version "$(sed -n 's/^version = \"\([^\"]*\)\"/\1/p' Cargo.toml | head -n1)" --commit "$GITHUB_SHA"
       - run: |
           cd target/release
           install -m 0755 net_helper rekaserdoba-net-helper
           sha256sum rekaserdoba-server rekaserdoba-net-helper h3_bridge rekaserdoba-server.cdx.json > SHA256SUMS
           tar -czf rekaserdoba-linux-x86_64.tar.gz rekaserdoba-server rekaserdoba-net-helper h3_bridge rekaserdoba-server.cdx.json SHA256SUMS
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: rekaserdoba-linux-x86_64
           path: rekaserdoba/target/release/rekaserdoba-linux-x86_64.tar.gz
@@ -44,13 +44,14 @@ jobs:
     name: Protocol tools
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: rekaserdoba/tools/requirements.txt
       - run: python -m pip install -r rekaserdoba/tools/requirements.txt
+      - run: python -m compileall -q rekaserdoba/tools
       - run: python -m unittest discover -s rekaserdoba/tools -p "test_*.py"
         env:
           PYTHONPATH: ${{ github.workspace }}/rekaserdoba/tools
@@ -59,11 +60,12 @@ jobs:
     name: Windows client
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.12"
       - run: python -m pip install cryptography==49.0.0 h2==4.3.0
+      - run: python -m compileall -q windows-client
       - run: python -m unittest -v windows-client\test_client.py
         env:
           PYTHONPATH: ${{ github.workspace }}\windows-client;${{ github.workspace }}
@@ -75,11 +77,11 @@ jobs:
       checks: write
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: python3 rekaserdoba/tools/check_repository_secrets.py .
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: rekaserdoba
-      - run: bash -n deploy/*.sh deploy/rekaserdoba-health-check
+      - run: bash -n deploy/*.sh deploy/rekaserdoba-health-check deploy/rekaserdoba-maintenance
       - run: git diff --check
