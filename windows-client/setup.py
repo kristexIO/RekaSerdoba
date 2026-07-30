@@ -325,6 +325,7 @@ def main():
     parser.add_argument("--elevated", action="store_true")
     parser.add_argument("--uninstall", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         validate_assets()
@@ -333,37 +334,45 @@ def main():
         elevated_args = ["--elevated"]
         if args.uninstall:
             elevated_args.append("--uninstall")
+        if args.quiet:
+            elevated_args.append("--quiet")
         try:
             elevate(elevated_args)
         except Exception as error:
             message(str(error), flags=MB_OK | MB_ICONERROR)
         return
     if args.uninstall:
-        if message(
+        if not args.quiet and message(
             "Удалить службу RekaSerdoba и восстановить сетевые настройки?",
             flags=MB_YESNO | MB_ICONQUESTION,
         ) != IDYES:
             return
         try:
             uninstall()
-            message("RekaSerdoba удалена. Сетевые настройки восстановлены.")
+            if not args.quiet:
+                message("RekaSerdoba удалена. Сетевые настройки восстановлены.")
         except Exception as error:
+            if args.quiet:
+                raise
             message(str(error), flags=MB_OK | MB_ICONERROR)
         return
-    if message(
+    if not args.quiet and message(
         "Установить и запустить защищённое подключение RekaSerdoba?",
         flags=MB_YESNO | MB_ICONQUESTION,
     ) != IDYES:
         return
     try:
         result = install()
-        message(
-            "RekaSerdoba установлена и запущена.\n\n"
-            f"Проверка соединения: {result or 'успешно'}"
-        )
-        subprocess.Popen([str(target_dir() / "RekaSerdoba.exe")])
+        if not args.quiet:
+            message(
+                "RekaSerdoba установлена и запущена.\n\n"
+                f"Проверка соединения: {result or 'успешно'}"
+            )
+            subprocess.Popen([str(target_dir() / "RekaSerdoba.exe")])
     except Exception as error:
         recover_after_failure()
+        if args.quiet:
+            raise
         message(
             "Установка не завершена. Сетевые настройки восстановлены.\n\n"
             + str(error),

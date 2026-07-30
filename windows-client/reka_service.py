@@ -42,7 +42,7 @@ SETTINGS = ROOT / "settings.json"
 STATUS = ROOT / "status.json"
 
 
-def write_status(state, carrier=None, reason=None, endpoint=None):
+def write_status(state, carrier=None, reason=None, endpoint=None, traffic=None):
     ROOT.mkdir(parents=True, exist_ok=True)
     value = {
         "version": VERSION,
@@ -55,6 +55,8 @@ def write_status(state, carrier=None, reason=None, endpoint=None):
         value["reason"] = reason
     if endpoint:
         value["endpoint"] = endpoint
+    if traffic:
+        value["traffic"] = traffic
     temporary = STATUS.with_suffix(".new")
     temporary.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
     os.replace(temporary, STATUS)
@@ -170,22 +172,22 @@ class TunnelRuntime:
         if not addresses:
             raise ValueError("manifest has no endpoint addresses")
         self.runtime_bundle = self._materialize_bundle(bundle)
-        if self.use_tun:
-            dll = Path(sys.executable).resolve().parent / "wintun.dll"
-            if not dll.exists():
-                dll = Path(__file__).resolve().parent / "wintun.dll"
-            self.adapter = WintunAdapter(dll)
-            address, prefix = bundle["tunnel_ipv4"].split("/", 1)
-            self.adapter.configure(address, int(prefix), 1280)
-            bridge = Path(sys.executable).resolve().parent / "h3_bridge.exe"
-            self.policy = NetworkPolicy(
-                POLICY_STATE,
-                sys.executable,
-                self.adapter.name,
-                [bridge] if bridge.exists() else [],
-            )
-            self.policy.recover()
         try:
+            if self.use_tun:
+                dll = Path(sys.executable).resolve().parent / "wintun.dll"
+                if not dll.exists():
+                    dll = Path(__file__).resolve().parent / "wintun.dll"
+                self.adapter = WintunAdapter(dll)
+                address, prefix = bundle["tunnel_ipv4"].split("/", 1)
+                self.adapter.configure(address, int(prefix), 1280)
+                bridge = Path(sys.executable).resolve().parent / "h3_bridge.exe"
+                self.policy = NetworkPolicy(
+                    POLICY_STATE,
+                    sys.executable,
+                    self.adapter.name,
+                    [bridge] if bridge.exists() else [],
+                )
+                self.policy.recover()
             while not self.stop_event.is_set():
                 attempted = False
                 for endpoint_ip, choice in scores.order_candidates(addresses, choices):
@@ -280,10 +282,15 @@ class TunnelRuntime:
             self.session.send_keepalive()
             self.session.receive()
             return
-        outbound = queue.Queue(maxsize=1024)
-        inbound = queue.Queue(maxsize=1024)
+        outbound = queue.Queue(maxsize=4096)
         failure = queue.Queue(maxsize=1)
         pump_stop = threading.Event()
+        traffic = {
+            "tx_packets": 0,
+            "tx_bytes": 0,
+            "rx_packets": 0,
+            "rx_bytes": 0,
+        }
 
         def read_adapter():
             try:
@@ -301,7 +308,9 @@ class TunnelRuntime:
                 while not self.stop_event.is_set() and not pump_stop.is_set():
                     packets = self.session.receive()
                     for packet in packets or []:
-                        inbound.put(packet, timeout=1)
+                        self.adapter.send(packet)
+                        traffic["rx_packets"] += 1
+                        traffic["rx_bytes"] += len(packet)
             except Exception as error:
                 _put_failure(failure, error)
 
@@ -322,15 +331,12 @@ class TunnelRuntime:
                 and not self.session.expired()
             ):
                 try:
-                    packet = outbound.get(timeout=0.05)
+                    packet = outbound.get(timeout=0.25)
                     self.session.send_packet(packet)
+                    traffic["tx_packets"] += 1
+                    traffic["tx_bytes"] += len(packet)
                 except queue.Empty:
                     pass
-                while True:
-                    try:
-                        self.adapter.send(inbound.get_nowait())
-                    except queue.Empty:
-                        break
                 if time.monotonic() >= keepalive:
                     self.session.send_keepalive()
                     keepalive = time.monotonic() + 15
@@ -339,6 +345,7 @@ class TunnelRuntime:
                         "connected",
                         self.carrier_name,
                         endpoint=endpoint_ip,
+                        traffic=traffic,
                     )
                     status_heartbeat = time.monotonic() + 10
             if not failure.empty():
@@ -347,26 +354,32 @@ class TunnelRuntime:
             pump_stop.set()
 
     def _materialize_bundle(self, bundle):
+        for stale in ROOT.glob("rs-device-*.json"):
+            stale.unlink(missing_ok=True)
         descriptor, name = tempfile.mkstemp(prefix="rs-device-", suffix=".json", dir=ROOT)
         os.close(descriptor)
         path = Path(name)
-        path.write_text(json.dumps(bundle, separators=(",", ":")), encoding="utf-8")
-        if os.name == "nt" and os.environ.get("REKASERDOBA_DEV_ACL") != "1":
-            import subprocess
+        try:
+            path.write_text(json.dumps(bundle, separators=(",", ":")), encoding="utf-8")
+            if os.name == "nt" and os.environ.get("REKASERDOBA_DEV_ACL") != "1":
+                import subprocess
 
-            subprocess.run(
-                [
-                    "icacls.exe",
-                    str(path),
-                    "/inheritance:r",
-                    "/grant:r",
-                    "*S-1-5-18:F",
-                    "*S-1-5-32-544:F",
-                ],
-                check=True,
-                capture_output=True,
-            )
-        return path
+                subprocess.run(
+                    [
+                        "icacls.exe",
+                        str(path),
+                        "/inheritance:r",
+                        "/grant:r",
+                        "*S-1-5-18:F",
+                        "*S-1-5-32-544:F",
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+            return path
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
 
 
 def _put_failure(target, error):

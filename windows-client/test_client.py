@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -16,15 +17,18 @@ from client_core import (
     _parse_frames,
 )
 from reka_service import (
+    TunnelRuntime,
     _valid_ipv4_packet,
     create_diagnostics,
     redact_log,
     select_transport_choices,
     transport_mode,
+    write_status,
 )
 from network_policy import NetworkPolicy
 from secret_store import protect, unprotect
 from setup import activate_staged_version, rollback_staged_version
+from wintun_adapter import Guid, open_or_create_adapter
 
 
 class ClientTests(unittest.TestCase):
@@ -88,6 +92,21 @@ class ClientTests(unittest.TestCase):
             path = Path(temporary) / "settings.json"
             path.write_text('{"transport":"wss"}', encoding="utf-8")
             self.assertEqual(transport_mode(path), "wss")
+
+    def test_existing_wintun_adapter_is_reused(self):
+        dll = Mock()
+        dll.WintunOpenAdapter.return_value = 17
+        adapter = open_or_create_adapter(dll, "RekaSerdoba", Guid())
+        self.assertEqual(adapter, 17)
+        dll.WintunCreateAdapter.assert_not_called()
+
+    def test_wintun_adapter_is_created_when_missing(self):
+        dll = Mock()
+        dll.WintunOpenAdapter.return_value = 0
+        dll.WintunCreateAdapter.return_value = 23
+        adapter = open_or_create_adapter(dll, "RekaSerdoba", Guid())
+        self.assertEqual(adapter, 23)
+        dll.WintunCreateAdapter.assert_called_once()
 
     def test_fragment_reassembly(self):
         fragments = FragmentReassembler(1280)
@@ -189,6 +208,43 @@ class ClientTests(unittest.TestCase):
                 self.assertIn("normal line", log)
                 self.assertIn("[redacted]", log)
                 self.assertNotIn("secret", log)
+
+    def test_status_includes_traffic_counters(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            status = root / "status.json"
+            with patch.multiple("reka_service", ROOT=root, STATUS=status):
+                write_status(
+                    "connected",
+                    "h3",
+                    endpoint="192.0.2.10",
+                    traffic={
+                        "tx_packets": 7,
+                        "tx_bytes": 700,
+                        "rx_packets": 9,
+                        "rx_bytes": 900,
+                    },
+                )
+            value = json.loads(status.read_text(encoding="utf-8"))
+            self.assertEqual(value["traffic"]["rx_bytes"], 900)
+
+    def test_runtime_bundle_replaces_stale_plaintext_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stale = root / "rs-device-stale.json"
+            stale.write_text("private", encoding="utf-8")
+            runtime = TunnelRuntime(Mock())
+            with (
+                patch("reka_service.ROOT", root),
+                patch.dict(os.environ, {"REKASERDOBA_DEV_ACL": "1"}),
+            ):
+                active = runtime._materialize_bundle({"client_id_b64": "value"})
+            self.assertFalse(stale.exists())
+            self.assertEqual(
+                json.loads(active.read_text(encoding="utf-8"))["client_id_b64"],
+                "value",
+            )
+            active.unlink()
 
     def test_log_redaction_is_bounded(self):
         value = redact_log("x" * 5000)
