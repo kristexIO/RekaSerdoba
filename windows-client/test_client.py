@@ -29,9 +29,19 @@ from network_policy import NetworkPolicy
 from secret_store import protect, unprotect
 from setup import activate_staged_version, rollback_staged_version
 from wintun_adapter import Guid, open_or_create_adapter
+from rekaserdoba.tools.probe import H2_RECEIVE_WINDOW, expand_h2_receive_window
 
 
 class ClientTests(unittest.TestCase):
+    def test_h2_receive_window_covers_high_latency_links(self):
+        connection = Mock()
+        expand_h2_receive_window(connection, 7)
+        increment = H2_RECEIVE_WINDOW - 65535
+        self.assertEqual(
+            connection.increment_flow_control_window.call_args_list,
+            [unittest.mock.call(increment), unittest.mock.call(increment, 7)],
+        )
+
     @patch("network_policy._ps")
     def test_endpoint_route_is_prepared_before_tunnel_activation(self, powershell):
         powershell.side_effect = [

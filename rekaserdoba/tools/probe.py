@@ -31,6 +31,8 @@ except ImportError:
     ResponseReceived = None
     StreamEnded = None
 
+H2_RECEIVE_WINDOW = 16 * 1024 * 1024
+
 
 def b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * ((4 - len(value) % 4) % 4))
@@ -213,10 +215,12 @@ class H2Carrier:
             ],
             end_stream=False,
         )
+        expand_h2_receive_window(self.connection, self.stream_id)
         self.sock.sendall(self.connection.data_to_send())
         self.buffer = bytearray()
         self.ended = False
         self._wait_response()
+        self.sock.settimeout(None)
 
     def _events(self):
         data = self.sock.recv(65535)
@@ -277,6 +281,12 @@ class H2Carrier:
         except Exception:
             pass
         self.sock.close()
+
+
+def expand_h2_receive_window(connection, stream_id: int) -> None:
+    increment = H2_RECEIVE_WINDOW - 65535
+    connection.increment_flow_control_window(increment)
+    connection.increment_flow_control_window(increment, stream_id)
 
 
 class H3ProcessCarrier:
@@ -430,6 +440,7 @@ def open_carrier(host: str, ip: str, path: str, authorization: str) -> ssl.SSLSo
     status = bytes(response).split(b"\r\n", 1)[0]
     if status != b"HTTP/1.1 101 Switching Protocols":
         raise RuntimeError(status.decode("ascii", "replace"))
+    sock.settimeout(None)
     return sock
 
 

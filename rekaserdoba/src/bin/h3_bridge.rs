@@ -11,7 +11,8 @@ use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::time::{MissedTickBehavior, interval};
 use wtransport::{
     ClientConfig, Endpoint,
     config::{DnsLookupFuture, DnsResolver},
@@ -76,12 +77,22 @@ async fn main() -> Result<()> {
     send_stream_message(&mut send, token.as_bytes()).await?;
 
     let mut input = tokio::io::stdin();
-    let mut output = tokio::io::stdout();
+    let mut output = BufWriter::with_capacity(256 * 1024, tokio::io::stdout());
+    let mut output_flush = interval(Duration::from_millis(2));
+    output_flush.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    output_flush.tick().await;
+    let mut output_dirty = false;
     let mut local_buffered = Vec::new();
     let mut buffered = Vec::new();
     loop {
         let datagram_connection = connection.clone();
         tokio::select! {
+            _ = output_flush.tick() => {
+                if output_dirty {
+                    output.flush().await?;
+                    output_dirty = false;
+                }
+            }
             local = read_local_message(&mut input, &mut local_buffered) => {
                 let Some(payload) = local? else {
                     break;
@@ -92,6 +103,7 @@ async fn main() -> Result<()> {
                 match reliable {
                     Ok(Some(payload)) => {
                         write_local_message(&mut output, &payload).await?;
+                        output_dirty = true;
                     }
                     Ok(None) | Err(_) => break,
                 };
@@ -100,11 +112,15 @@ async fn main() -> Result<()> {
                 match datagram {
                     Ok(payload) => {
                         write_local_message(&mut output, &payload).await?;
+                        output_dirty = true;
                     }
                     Err(_) => break,
                 }
             }
         }
+    }
+    if output_dirty {
+        output.flush().await?;
     }
     let _ = send.finish().await;
     Ok(())
@@ -180,7 +196,6 @@ async fn write_local_message<W: AsyncWrite + Unpin>(output: &mut W, payload: &[u
         .write_all(&u32::try_from(payload.len())?.to_be_bytes())
         .await?;
     output.write_all(payload).await?;
-    output.flush().await?;
     Ok(())
 }
 
