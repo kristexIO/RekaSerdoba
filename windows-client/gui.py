@@ -488,24 +488,14 @@ class RekaGui:
 
     def restart_service(self):
         executable = Path(sys_executable_dir()) / "reka-service.exe"
-        stop = subprocess.run(
-            [str(executable), "stop"],
+        result = subprocess.run(
+            [str(executable), "restart"],
             check=False,
             capture_output=True,
             text=True,
             creationflags=0x08000000,
         )
-        if stop.returncode != 0:
-            self.root.after(0, lambda: self.command_finished(stop))
-            return
-        start = subprocess.run(
-            [str(executable), "start"],
-            check=False,
-            capture_output=True,
-            text=True,
-            creationflags=0x08000000,
-        )
-        self.root.after(0, lambda: self.command_finished(start))
+        self.root.after(0, lambda: self.command_finished(result))
 
     def run_command(self, command):
         executable = Path(sys_executable_dir()) / "reka-service.exe"

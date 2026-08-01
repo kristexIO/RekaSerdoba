@@ -97,20 +97,27 @@ impl Server {
             let path = self.path.clone();
             let decoy_root = self.decoy_root.clone();
             let sessions = sessions.clone();
-            let Ok(permit) = connections.clone().acquire_owned().await else {
-                return;
+            let Ok(permit) = connections.clone().try_acquire_owned() else {
+                drop(incoming);
+                continue;
             };
             tokio::spawn(async move {
                 let _permit = permit;
-                match accept_connection(incoming, &authority, &path, decoy_root).await {
-                    Ok(Some(session)) => {
+                match tokio::time::timeout(
+                    Duration::from_secs(15),
+                    accept_connection(incoming, &authority, &path, decoy_root),
+                )
+                .await
+                {
+                    Ok(Ok(Some(session))) => {
                         if let Err(error) = sessions.send(session).await {
                             let mut session = error.0;
                             session.close().await;
                         }
                     }
-                    Ok(None) => {}
-                    Err(error) => warn!(reason = %error, "H3 connection failed"),
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => warn!(reason = %error, "H3 connection failed"),
+                    Err(_) => warn!("H3 connection timed out"),
                 }
             });
         }
@@ -181,7 +188,6 @@ impl Session {
 
     pub async fn write_reliable(&mut self, value: &[u8]) -> Result<()> {
         self.send.write_all(value).await?;
-        self.send.flush().await?;
         Ok(())
     }
 
@@ -272,8 +278,10 @@ async fn serve_session_requests(session: Arc<WebTransportConnection>, decoy_root
         match session.accept_bi().await {
             Ok(Some(AcceptedBi::Request(request, stream))) => {
                 let root = decoy_root.clone();
-                let Ok(permit) = requests.clone().acquire_owned().await else {
-                    return;
+                let Ok(permit) = requests.clone().try_acquire_owned() else {
+                    let mut stream = stream;
+                    let _ = stream.shutdown().await;
+                    continue;
                 };
                 tokio::spawn(async move {
                     let _permit = permit;

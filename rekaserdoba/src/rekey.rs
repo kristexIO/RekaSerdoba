@@ -19,6 +19,7 @@ type HmacSha256 = Hmac<Sha256>;
 const UPDATE_INTERVAL: Duration = Duration::from_secs(600);
 const UPDATE_RECORD_LIMIT: u64 = 1 << 20;
 const UPDATE_BYTE_LIMIT: u64 = 1 << 30;
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
 const OLD_EPOCH_GRACE: Duration = Duration::from_secs(3);
 const OLD_EPOCH_RECORDS: u16 = 128;
 
@@ -73,6 +74,7 @@ pub struct RekeySession {
     data_records: u64,
     plaintext_bytes: u64,
     update_requested: bool,
+    update_deadline: Option<Instant>,
 }
 
 impl RekeySession {
@@ -102,6 +104,7 @@ impl RekeySession {
             data_records: 0,
             plaintext_bytes: 0,
             update_requested: false,
+            update_deadline: None,
         })
     }
 
@@ -228,6 +231,7 @@ impl RekeySession {
             },
         });
         self.update_requested = true;
+        self.update_deadline = Some(now + UPDATE_TIMEOUT);
         self.expire_previous(now);
         Ok(ack_record)
     }
@@ -294,6 +298,7 @@ impl RekeySession {
         self.data_records = 0;
         self.plaintext_bytes = 0;
         self.update_requested = false;
+        self.update_deadline = None;
         Ok(done_record)
     }
 
@@ -303,6 +308,7 @@ impl RekeySession {
         body: &[u8],
         client_key: &VerifyingKey,
         server_key: &SigningKey,
+        now: Instant,
     ) -> Result<Vec<u8>> {
         if body.len() != 120 || self.pending.is_some() {
             bail!("invalid or concurrent full rekey");
@@ -403,6 +409,7 @@ impl RekeySession {
             },
         });
         self.update_requested = true;
+        self.update_deadline = Some(now + UPDATE_TIMEOUT);
         Ok(reply)
     }
 
@@ -467,10 +474,14 @@ impl RekeySession {
         self.data_records = 0;
         self.plaintext_bytes = 0;
         self.update_requested = false;
+        self.update_deadline = None;
         Ok(done_record)
     }
 
     pub fn request_update_if_due(&mut self, now: Instant) -> Result<Option<Vec<u8>>> {
+        if self.update_deadline.is_some_and(|deadline| now >= deadline) {
+            bail!("key update timed out");
+        }
         if self.pending.is_some() || self.update_requested {
             return Ok(None);
         }
@@ -491,6 +502,7 @@ impl RekeySession {
         )?;
         self.transcript = transcript_next(self.transcript, &record);
         self.update_requested = true;
+        self.update_deadline = Some(now + UPDATE_TIMEOUT);
         Ok(Some(record))
     }
 
@@ -544,8 +556,10 @@ impl RekeySession {
     }
 
     pub fn next_update_check(&self, now: Instant) -> Instant {
-        if self.pending.is_some() || self.update_requested {
-            now + Duration::from_secs(3600)
+        if let Some(deadline) = self.update_deadline {
+            deadline
+        } else if self.pending.is_some() || self.update_requested {
+            now + UPDATE_TIMEOUT
         } else {
             self.epoch_started + UPDATE_INTERVAL
         }
@@ -728,5 +742,26 @@ mod tests {
         .unwrap();
         assert_eq!(receiver.open(&done).unwrap()[0], 0x08);
         assert_eq!(ack[17..21], 0u32.to_be_bytes());
+    }
+
+    #[test]
+    fn rejects_stalled_key_update() {
+        let session_id = [7u8; 16];
+        let secret = [9u8; 32];
+        let now = Instant::now();
+        let keys = EpochKeys::derive(secret, session_id, 0).unwrap();
+        let mut session =
+            RekeySession::new(session_id, Zeroizing::new(secret), keys, [3u8; 32], now).unwrap();
+        assert!(
+            session
+                .request_update_if_due(now + UPDATE_INTERVAL)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            session
+                .request_update_if_due(now + UPDATE_INTERVAL + UPDATE_TIMEOUT)
+                .is_err()
+        );
     }
 }

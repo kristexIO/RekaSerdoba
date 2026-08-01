@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::{Buf, BytesMut};
 use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
@@ -82,8 +83,8 @@ async fn main() -> Result<()> {
     output_flush.set_missed_tick_behavior(MissedTickBehavior::Skip);
     output_flush.tick().await;
     let mut output_dirty = false;
-    let mut local_buffered = Vec::new();
-    let mut buffered = Vec::new();
+    let mut local_buffered = BytesMut::with_capacity(64 * 1024);
+    let mut buffered = BytesMut::with_capacity(64 * 1024);
     loop {
         let datagram_connection = connection.clone();
         tokio::select! {
@@ -160,7 +161,7 @@ fn gate_token(
 
 async fn read_local_message<R: AsyncRead + Unpin>(
     input: &mut R,
-    buffered: &mut Vec<u8>,
+    buffered: &mut BytesMut,
 ) -> Result<Option<Vec<u8>>> {
     loop {
         if let Some(message) = take_local_message(buffered)? {
@@ -175,7 +176,7 @@ async fn read_local_message<R: AsyncRead + Unpin>(
     }
 }
 
-fn take_local_message(buffered: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
+fn take_local_message(buffered: &mut BytesMut) -> Result<Option<Vec<u8>>> {
     if buffered.len() < 4 {
         return Ok(None);
     }
@@ -186,9 +187,9 @@ fn take_local_message(buffered: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
     if buffered.len() < 4 + length {
         return Ok(None);
     }
-    let message = buffered[4..4 + length].to_vec();
-    buffered.drain(..4 + length);
-    Ok(Some(message))
+    let mut message = buffered.split_to(4 + length);
+    message.advance(4);
+    Ok(Some(message.to_vec()))
 }
 
 async fn write_local_message<W: AsyncWrite + Unpin>(output: &mut W, payload: &[u8]) -> Result<()> {
@@ -212,7 +213,7 @@ async fn send_stream_message(
 
 async fn recv_stream_message(
     stream: &mut wtransport::stream::RecvStream,
-    buffered: &mut Vec<u8>,
+    buffered: &mut BytesMut,
 ) -> Result<Option<Vec<u8>>> {
     loop {
         if buffered.len() >= 4 {
@@ -221,9 +222,9 @@ async fn recv_stream_message(
                 bail!("invalid WebTransport message length");
             }
             if buffered.len() >= 4 + length {
-                let message = buffered[4..4 + length].to_vec();
-                buffered.drain(..4 + length);
-                return Ok(Some(message));
+                let mut message = buffered.split_to(4 + length);
+                message.advance(4);
+                return Ok(Some(message.to_vec()));
             }
         }
         let mut chunk = [0u8; 8192];
@@ -252,11 +253,13 @@ fn hash_parts(parts: &[&[u8]]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    use bytes::BytesMut;
+
     use super::take_local_message;
 
     #[test]
     fn local_frame_survives_partial_reads() {
-        let mut buffered = vec![0, 0];
+        let mut buffered = BytesMut::from(&[0, 0][..]);
         assert!(take_local_message(&mut buffered).unwrap().is_none());
         buffered.extend_from_slice(&[0, 3, b'a']);
         assert!(take_local_message(&mut buffered).unwrap().is_none());
