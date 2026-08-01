@@ -37,7 +37,7 @@ jobs:
           sha256sum rekaserdoba-server rekaserdoba-net-helper h3_bridge rekaserdoba-server.cdx.json > SHA256SUMS
           tar -czf rekaserdoba-linux-x86_64.tar.gz rekaserdoba-server rekaserdoba-net-helper h3_bridge rekaserdoba-server.cdx.json SHA256SUMS
           sha256sum rekaserdoba-linux-x86_64.tar.gz > rekaserdoba-linux-x86_64.tar.gz.sha256
-      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
         with:
           subject-path: rekaserdoba/target/release/rekaserdoba-linux-x86_64.tar.gz
       - run: gh release create "$GITHUB_REF_NAME" target/release/rekaserdoba-linux-x86_64.tar.gz target/release/rekaserdoba-linux-x86_64.tar.gz.sha256 target/release/rekaserdoba-server.cdx.json --verify-tag --generate-notes
@@ -62,7 +62,7 @@ jobs:
         run: |
           $hash = (Get-FileHash -Algorithm SHA256 target\release\h3_bridge.exe).Hash.ToLowerInvariant()
           "$hash  h3_bridge.exe" | Set-Content -Encoding ascii target\release\h3_bridge.exe.sha256
-      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
         with:
           subject-path: rekaserdoba/target/release/h3_bridge.exe
       - shell: pwsh
