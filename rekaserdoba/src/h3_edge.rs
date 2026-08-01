@@ -279,8 +279,7 @@ async fn serve_session_requests(session: Arc<WebTransportConnection>, decoy_root
             Ok(Some(AcceptedBi::Request(request, stream))) => {
                 let root = decoy_root.clone();
                 let Ok(permit) = requests.clone().try_acquire_owned() else {
-                    let mut stream = stream;
-                    let _ = stream.shutdown().await;
+                    drop(stream);
                     continue;
                 };
                 tokio::spawn(async move {
