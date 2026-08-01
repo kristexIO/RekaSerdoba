@@ -178,8 +178,6 @@ class TunnelRuntime:
                 if not dll.exists():
                     dll = Path(__file__).resolve().parent / "wintun.dll"
                 self.adapter = WintunAdapter(dll)
-                address, prefix = bundle["tunnel_ipv4"].split("/", 1)
-                self.adapter.configure(address, int(prefix), 1280)
                 bridge = Path(sys.executable).resolve().parent / "h3_bridge.exe"
                 self.policy = NetworkPolicy(
                     POLICY_STATE,
@@ -219,6 +217,12 @@ class TunnelRuntime:
                             server_public,
                             bridge if bridge.exists() else None,
                         )
+                        if self.adapter:
+                            self.adapter.configure(
+                                self.session.parameters.ipv4,
+                                self.session.parameters.prefix,
+                                self.session.parameters.mtu,
+                            )
                         scores.success(choice.name, endpoint_ip)
                         self.carrier_name = choice.name
                         write_status(
@@ -331,10 +335,15 @@ class TunnelRuntime:
                 and not self.session.expired()
             ):
                 try:
-                    packet = outbound.get(timeout=0.25)
-                    self.session.send_packet(packet)
-                    traffic["tx_packets"] += 1
-                    traffic["tx_bytes"] += len(packet)
+                    packets = [outbound.get(timeout=0.25)]
+                    while len(packets) < 32:
+                        try:
+                            packets.append(outbound.get_nowait())
+                        except queue.Empty:
+                            break
+                    self.session.send_packets(packets)
+                    traffic["tx_packets"] += len(packets)
+                    traffic["tx_bytes"] += sum(len(packet) for packet in packets)
                 except queue.Empty:
                     pass
                 if time.monotonic() >= keepalive:
@@ -397,6 +406,32 @@ def _valid_ipv4_packet(packet, expected_source):
     if header_length < 20 or total_length < header_length or total_length > len(packet):
         return False
     return packet[12:16] == socket.inet_aton(expected_source)
+
+
+def wait_service_state(expected, timeout=20):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        query = subprocess.run(
+            ["sc.exe", "query", SERVICE_NAME],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if expected in query.stdout:
+            return
+        time.sleep(0.25)
+    raise RuntimeError(f"service did not reach {expected}")
+
+
+def stop_service():
+    subprocess.run(["sc.exe", "stop", SERVICE_NAME], check=False)
+    wait_service_state("STOPPED")
+    NetworkPolicy(POLICY_STATE, sys.executable, "RekaSerdoba").recover()
+
+
+def start_service():
+    subprocess.run(["sc.exe", "start", SERVICE_NAME], check=True)
+    wait_service_state("RUNNING")
 
 
 if win32serviceutil:
@@ -482,6 +517,7 @@ def main():
     sub.add_parser("remove")
     sub.add_parser("start")
     sub.add_parser("stop")
+    sub.add_parser("restart")
     sub.add_parser("service")
     args = parser.parse_args()
     if args.command == "import":
@@ -525,21 +561,12 @@ def main():
     elif args.command == "remove":
         subprocess.run(["sc.exe", "delete", SERVICE_NAME], check=True)
     elif args.command == "start":
-        subprocess.run(["sc.exe", "start", SERVICE_NAME], check=True)
+        start_service()
     elif args.command == "stop":
-        subprocess.run(["sc.exe", "stop", SERVICE_NAME], check=False)
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            query = subprocess.run(
-                ["sc.exe", "query", SERVICE_NAME],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if "STOPPED" in query.stdout:
-                break
-            time.sleep(0.5)
-        NetworkPolicy(POLICY_STATE, sys.executable, "RekaSerdoba").recover()
+        stop_service()
+    elif args.command == "restart":
+        stop_service()
+        start_service()
     elif args.command == "service":
         servicemanager.Initialize()
         servicemanager.PrepareToHostSingle(RekaService)

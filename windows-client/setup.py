@@ -175,9 +175,18 @@ def activate_staged_version(destination):
     if previous.exists():
         shutil.rmtree(previous)
     copy_assets(staging)
-    if destination.exists():
-        os.replace(destination, previous)
-    os.replace(staging, destination)
+    moved = False
+    try:
+        if destination.exists():
+            os.replace(destination, previous)
+            moved = True
+        os.replace(staging, destination)
+    except Exception:
+        if moved and previous.exists() and not destination.exists():
+            os.replace(previous, destination)
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
     return previous
 
 
@@ -277,9 +286,17 @@ def schedule_cleanup(destination):
 def install():
     validate_assets()
     destination = target_dir()
+    had_existing = destination.exists()
     run(["taskkill.exe", "/IM", "RekaSerdoba.exe", "/F"], check=False)
     stop_existing_service(destination)
-    previous = activate_staged_version(destination)
+    try:
+        previous = activate_staged_version(destination)
+    except Exception:
+        service = destination / "reka-service.exe"
+        if had_existing and service.exists():
+            run([service, "install"])
+            run([service, "start"])
+        raise
     try:
         service = destination / "reka-service.exe"
         bundle = destination / "RekaSerdoba_client_bundle.json"

@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import struct
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -125,6 +126,51 @@ class FragmentReassembler:
             return None
         self.assemblies.pop(packet_id, None)
         return bytes(output)
+
+
+class ReplayWindow:
+    def __init__(self, width=4096):
+        if width < 256 or width > 16384 or width % 64:
+            raise ValueError("invalid replay window width")
+        self.width = width
+        self.initialized = False
+        self.highest = 0
+        self.bits = [0] * (width // 64)
+
+    def plausible(self, number):
+        if not self.initialized:
+            return True
+        if number + self.width <= self.highest:
+            return False
+        if number > self.highest:
+            return True
+        word, mask = self._slot(number)
+        return self.bits[word] & mask == 0
+
+    def commit_authenticated(self, number):
+        if not self.plausible(number):
+            return False
+        if not self.initialized:
+            self.initialized = True
+            self.highest = number
+        elif number > self.highest:
+            distance = number - self.highest
+            if distance >= self.width:
+                self.bits = [0] * len(self.bits)
+            else:
+                for cleared in range(self.highest + 1, number + 1):
+                    word, mask = self._slot(cleared)
+                    self.bits[word] &= ~mask
+            self.highest = number
+        word, mask = self._slot(number)
+        if self.bits[word] & mask:
+            return False
+        self.bits[word] |= mask
+        return True
+
+    def _slot(self, number):
+        offset = number % self.width
+        return offset // 64, 1 << (offset % 64)
 
 
 class ManifestState:
@@ -288,7 +334,7 @@ class RekaSession:
         self.parameters = parameters
         self.epoch = 0
         self.c2s_number = 0
-        self.s2c_seen = {False: set(), True: set()}
+        self.s2c_windows = {False: ReplayWindow(), True: ReplayWindow()}
         self.c2s_data_key = secrets["c2s_data_key"]
         self.s2c_data_key = secrets["s2c_data_key"]
         self.c2s_data_iv = secrets["c2s_data_iv"]
@@ -297,7 +343,12 @@ class RekaSession:
         self.s2c_control_key = secrets["s2c_control_key"]
         self.c2s_control_iv = secrets["c2s_control_iv"]
         self.s2c_control_iv = secrets["s2c_control_iv"]
+        self.epoch_secret = secrets["epoch_secret"]
+        self.control_transcript = secrets["control_transcript"]
         self.control_number = 0
+        self.pending_rekey = None
+        self.state_lock = threading.RLock()
+        self.send_lock = threading.Lock()
         self.created = time.monotonic()
         self.fragments = FragmentReassembler(parameters.mtu)
 
@@ -361,77 +412,238 @@ class RekaSession:
     def send_packet(self, packet):
         if len(packet) > self.parameters.mtu:
             raise ValueError("packet exceeds negotiated MTU")
-        maximum_fragment = 900
-        if len(packet) <= maximum_fragment:
-            self._send_data(frame(0x01, packet))
-            return
-        packet_id = int.from_bytes(os.urandom(4), "big")
-        for offset in range(0, len(packet), maximum_fragment):
-            value = packet[offset : offset + maximum_fragment]
-            body = (
-                packet_id.to_bytes(4, "big")
-                + len(packet).to_bytes(2, "big")
-                + offset.to_bytes(2, "big")
-                + len(value).to_bytes(2, "big")
-                + value
-            )
-            self._send_data(frame(0x03, body))
+        self.send_packets([packet])
+
+    def send_packets(self, packets):
+        batches = []
+        plaintext = bytearray()
+        for packet in packets:
+            if len(packet) > self.parameters.mtu:
+                raise ValueError("packet exceeds negotiated MTU")
+            encoded = frame(0x01, packet)
+            if len(encoded) > 4080:
+                raise ValueError("packet exceeds record capacity")
+            if plaintext and len(plaintext) + len(encoded) > 4080:
+                batches.append(bytes(plaintext))
+                plaintext.clear()
+            plaintext.extend(encoded)
+        if plaintext:
+            batches.append(bytes(plaintext))
+        for batch in batches:
+            self._send_data(batch)
 
     def send_keepalive(self):
         self._send_data(frame(0x04))
 
     def _send_data(self, plaintext):
-        record = seal_application_record(
-            self.c2s_data_key,
-            self.c2s_data_iv,
-            self.parameters.session_id,
-            self.epoch,
-            self.c2s_number,
-            False,
-            plaintext,
-        )
-        self.c2s_number += 1
-        send_ws(self.carrier, 2, record)
+        with self.state_lock:
+            record = seal_application_record(
+                self.c2s_data_key,
+                self.c2s_data_iv,
+                self.parameters.session_id,
+                self.epoch,
+                self.c2s_number,
+                False,
+                plaintext,
+            )
+            self.c2s_number += 1
+            with self.send_lock:
+                send_ws(self.carrier, 2, record)
 
     def receive(self):
         opcode, record = recv_ws(self.carrier)
         if opcode != 2 or len(record) < 31:
             return None
-        flags = record[0]
-        if flags >> 4 != 1 or flags & 0x01 or record[1:17] != self.parameters.session_id:
-            raise ValueError("invalid application record")
-        epoch = int.from_bytes(record[17:21], "big")
-        number = int.from_bytes(record[21:29], "big")
-        control = bool(flags & 0x08)
-        seen = self.s2c_seen[control]
-        if epoch != self.epoch or number in seen:
-            raise ValueError("record replay or epoch mismatch")
-        seen.add(number)
-        if len(seen) > 8192:
-            floor = max(seen) - 4096
-            self.s2c_seen[control] = {value for value in seen if value >= floor}
-        plaintext = open_application_record(
-            self.s2c_control_key if control else self.s2c_data_key,
-            self.s2c_control_iv if control else self.s2c_data_iv,
+        with self.state_lock:
+            flags = record[0]
+            if flags >> 4 != 1 or flags & 0x01 or record[1:17] != self.parameters.session_id:
+                raise ValueError("invalid application record")
+            epoch = int.from_bytes(record[17:21], "big")
+            number = int.from_bytes(record[21:29], "big")
+            control = bool(flags & 0x08)
+            if epoch == self.epoch:
+                keys = self._current_receive_keys(control)
+                window = self.s2c_windows[control]
+                pending = False
+            elif self.pending_rekey and epoch == self.pending_rekey["epoch"] and control:
+                keys = (
+                    self.pending_rekey["s2c_control_key"],
+                    self.pending_rekey["s2c_control_iv"],
+                )
+                window = self.pending_rekey["s2c_windows"][True]
+                pending = True
+            else:
+                raise ValueError("record epoch mismatch")
+            if not window.plausible(number):
+                raise ValueError("record replay rejected")
+            plaintext = open_application_record(
+                keys[0],
+                keys[1],
+                self.parameters.session_id,
+                epoch,
+                number,
+                control,
+                record,
+            )
+            if not window.commit_authenticated(number):
+                raise ValueError("record replay rejected")
+            frames = _parse_frames(plaintext)
+            if control and len(frames) != 1 and any(0x04 <= kind <= 0x11 for kind, _ in frames):
+                raise ValueError("security-critical control record must contain one frame")
+            packets = []
+            for kind, body in frames:
+                if kind == 0x01 and not control:
+                    packets.append(body)
+                elif kind == 0x03 and not control:
+                    packet = self.fragments.push(body)
+                    if packet is not None:
+                        packets.append(packet)
+                elif kind == 0x04 and control and not pending:
+                    self._accept_update_request(record, body)
+                elif kind == 0x06 and control and not pending:
+                    self._accept_update_ack(record, body)
+                elif kind == 0x08 and control and pending:
+                    self._accept_update_done(record, body)
+            return packets
+
+    def _current_receive_keys(self, control):
+        if control:
+            return self.s2c_control_key, self.s2c_control_iv
+        return self.s2c_data_key, self.s2c_data_iv
+
+    def _accept_update_request(self, record, body):
+        if len(body) != 4 or int.from_bytes(body, "big") != self.epoch:
+            raise ValueError("invalid key update request")
+        if self.pending_rekey is not None:
+            raise ValueError("concurrent key update")
+        self.control_transcript = transcript(self.control_transcript, record)
+        next_epoch = self.epoch + 1
+        nonce = os.urandom(32)
+        update_input = (
+            b"RekaSerdoba/1 epoch update"
+            + self.parameters.session_id
+            + struct.pack(">II", self.epoch, next_epoch)
+            + nonce
+            + self.control_transcript
+        )
+        context = sha(update_input)
+        tag = hmac.new(self.epoch_secret, update_input, hashlib.sha256).digest()
+        body = struct.pack(">II", self.epoch, next_epoch) + nonce + tag
+        encoded = self._seal_current_control(frame(0x05, body))
+        self.control_transcript = transcript(self.control_transcript, encoded)
+        self.pending_rekey = {
+            "epoch": next_epoch,
+            "context": context,
+            "started": time.monotonic(),
+        }
+        with self.send_lock:
+            send_ws(self.carrier, 2, encoded)
+
+    def _accept_update_ack(self, record, body):
+        pending = self.pending_rekey
+        if pending is None or len(body) != 36:
+            raise ValueError("unexpected key update acknowledgment")
+        next_epoch = int.from_bytes(body[:4], "big")
+        if next_epoch != pending["epoch"]:
+            raise ValueError("key update acknowledgment epoch mismatch")
+        next_secret = hmac.new(
+            self.epoch_secret, pending["context"], hashlib.sha256
+        ).digest()
+        next_context = self.parameters.session_id + struct.pack(">I", next_epoch)
+        confirm_key = expand_label(
+            next_secret, "epoch confirmation", next_context, 32
+        )
+        expected = hmac.new(
+            confirm_key,
+            b"server ack" + pending["context"],
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(body[4:], expected):
+            raise ValueError("invalid key update acknowledgment")
+        for name, label, length in [
+            ("c2s_data_key", "data c2s key", 32),
+            ("s2c_data_key", "data s2c key", 32),
+            ("c2s_data_iv", "data c2s iv", 12),
+            ("s2c_data_iv", "data s2c iv", 12),
+            ("c2s_control_key", "control c2s key", 32),
+            ("s2c_control_key", "control s2c key", 32),
+            ("c2s_control_iv", "control c2s iv", 12),
+            ("s2c_control_iv", "control s2c iv", 12),
+        ]:
+            pending[name] = expand_label(next_secret, label, next_context, length)
+        pending["secret"] = next_secret
+        pending["confirm_key"] = confirm_key
+        pending["s2c_windows"] = {False: ReplayWindow(), True: ReplayWindow()}
+        self.control_transcript = transcript(self.control_transcript, record)
+        commit_tag = hmac.new(
+            confirm_key,
+            b"client commit" + pending["context"],
+            hashlib.sha256,
+        ).digest()
+        commit = seal_application_record(
+            pending["c2s_control_key"],
+            pending["c2s_control_iv"],
+            self.parameters.session_id,
+            next_epoch,
+            0,
+            True,
+            frame(0x07, struct.pack(">I", next_epoch) + commit_tag),
+        )
+        self.control_transcript = transcript(self.control_transcript, commit)
+        pending["phase"] = "commit"
+        with self.send_lock:
+            send_ws(self.carrier, 2, commit)
+
+    def _accept_update_done(self, record, body):
+        pending = self.pending_rekey
+        if pending is None or pending.get("phase") != "commit" or len(body) != 36:
+            raise ValueError("unexpected key update completion")
+        next_epoch = int.from_bytes(body[:4], "big")
+        expected = hmac.new(
+            pending["confirm_key"],
+            b"server done" + pending["context"],
+            hashlib.sha256,
+        ).digest()
+        if next_epoch != pending["epoch"] or not hmac.compare_digest(body[4:], expected):
+            raise ValueError("invalid key update completion")
+        self.control_transcript = transcript(self.control_transcript, record)
+        for name in [
+            "c2s_data_key",
+            "s2c_data_key",
+            "c2s_data_iv",
+            "s2c_data_iv",
+            "c2s_control_key",
+            "s2c_control_key",
+            "c2s_control_iv",
+            "s2c_control_iv",
+        ]:
+            setattr(self, name, pending[name])
+        self.epoch_secret = pending["secret"]
+        self.epoch = next_epoch
+        self.c2s_number = 0
+        self.control_number = 1
+        self.s2c_windows = pending["s2c_windows"]
+        self.pending_rekey = None
+
+    def _seal_current_control(self, plaintext):
+        record = seal_application_record(
+            self.c2s_control_key,
+            self.c2s_control_iv,
             self.parameters.session_id,
             self.epoch,
-            number,
-            control,
-            record,
+            self.control_number,
+            True,
+            plaintext,
         )
-        frames = _parse_frames(plaintext)
-        packets = []
-        for kind, body in frames:
-            if kind == 0x01:
-                packets.append(body)
-            elif kind == 0x03:
-                packet = self.fragments.push(body)
-                if packet is not None:
-                    packets.append(packet)
-        return packets
+        self.control_number += 1
+        return record
 
     def expired(self):
-        return time.monotonic() - self.created >= min(self.parameters.lifetime - 60, 1200)
+        now = time.monotonic()
+        if self.pending_rekey and now - self.pending_rekey["started"] >= 10:
+            return True
+        margin = min(60, max(5, self.parameters.lifetime // 10))
+        return now - self.created >= max(1, self.parameters.lifetime - margin)
 
     def close(self):
         _close_carrier(self.carrier)
@@ -559,6 +771,10 @@ def _handshake(carrier, client_id, client_signing, client_public, server_public)
         ("s2c_control_iv", "control s2c iv", 12),
     ]:
         secrets[name] = expand_label(epoch_secret, label, context, length)
+    secrets["epoch_secret"] = epoch_secret
+    secrets["control_transcript"] = sha(
+        b"RekaSerdoba/1 control transcript", t5, session_id
+    )
     return SessionParameters(session_id, ipv4, prefix, mtu, lifetime), secrets
 
 

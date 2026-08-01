@@ -218,6 +218,7 @@ class H2Carrier:
         expand_h2_receive_window(self.connection, self.stream_id)
         self.sock.sendall(self.connection.data_to_send())
         self.buffer = bytearray()
+        self.buffer_offset = 0
         self.ended = False
         self._wait_response()
         self.sock.settimeout(None)
@@ -259,13 +260,18 @@ class H2Carrier:
 
     def recv_message(self):
         while True:
-            if len(self.buffer) >= 4:
-                length = int.from_bytes(self.buffer[:4], "big")
+            available = len(self.buffer) - self.buffer_offset
+            if available >= 4:
+                start = self.buffer_offset
+                length = int.from_bytes(self.buffer[start : start + 4], "big")
                 if length == 0 or length > 8192:
                     raise ValueError("invalid HTTP/2 carrier message length")
-                if len(self.buffer) >= 4 + length:
-                    payload = bytes(self.buffer[4 : 4 + length])
-                    del self.buffer[: 4 + length]
+                if available >= 4 + length:
+                    payload = bytes(self.buffer[start + 4 : start + 4 + length])
+                    self.buffer_offset += 4 + length
+                    if self.buffer_offset >= 65536 or self.buffer_offset * 2 >= len(self.buffer):
+                        del self.buffer[: self.buffer_offset]
+                        self.buffer_offset = 0
                     return payload
             if self.ended:
                 raise EOFError("HTTP/2 response ended")

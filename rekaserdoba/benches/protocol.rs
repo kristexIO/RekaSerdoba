@@ -1,6 +1,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use rekaserdoba_server::record::{
-    EpochKeys, RecordKind, RecordReceiver, RecordSender, parse_frames,
+use rekaserdoba_server::{
+    packet_batch::batch_packets,
+    record::{EpochKeys, RecordKind, RecordReceiver, RecordSender, parse_frames},
 };
 
 fn protocol(c: &mut Criterion) {
@@ -43,6 +44,14 @@ fn protocol(c: &mut Criterion) {
     });
     crypto.finish();
     std::hint::black_box(number);
+
+    let packets = vec![vec![0x31; 1280], vec![0x32; 1280], vec![0x33; 1280]];
+    let mut batching = c.benchmark_group("packet_batch");
+    batching.throughput(Throughput::Bytes(3840));
+    batching.bench_function("three_mtu_packets", |b| {
+        b.iter(|| batch_packets(packets.clone(), 4080).unwrap())
+    });
+    batching.finish();
 }
 
 criterion_group!(benches, protocol);

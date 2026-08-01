@@ -47,7 +47,8 @@ mod network;
 use network::{Network, TunSettings};
 use rekaserdoba_server::{
     fragment::FragmentReassembler,
-    record::{ApplicationSecrets, Frame, RecordKind, parse_frames},
+    packet_batch::batch_packets,
+    record::{ApplicationSecrets, Frame, MAX_CIPHERTEXT_LEN, RecordKind, parse_frames},
     rekey::{EpochPosition, RekeySession},
     session::SessionPolicy,
 };
@@ -1420,8 +1421,16 @@ async fn run_established_session(
                 let Some(packet) = packet else {
                     return Ok(());
                 };
-                shape_traffic(&mut session.policy, packet.len(), metrics).await?;
-                send_outbound_packet(carrier, session, packet).await?;
+                let mut packets = vec![packet];
+                while packets.len() < 32 {
+                    match outbound.try_recv() {
+                        Ok(packet) => packets.push(packet),
+                        Err(_) => break,
+                    }
+                }
+                let bytes = packets.iter().map(Vec::len).sum();
+                shape_traffic(&mut session.policy, bytes, metrics).await?;
+                send_outbound_packets(carrier, session, packets).await?;
             }
             migration = migrations.recv() => {
                 let Some(mut migration) = migration else {
@@ -1452,7 +1461,6 @@ async fn run_established_session(
             }
         }
         if let Some(record) = session.crypto.request_update_if_due(Instant::now())? {
-            metrics.routine_rekeys_total.fetch_add(1, Ordering::Relaxed);
             carrier.send_binary(record).await?;
         }
         update_check.as_mut().reset(tokio::time::Instant::from_std(
@@ -1473,18 +1481,24 @@ async fn recv_draining_carrier(
     }
 }
 
-async fn send_outbound_packet(
+async fn send_outbound_packets(
     carrier: &mut Carrier,
     session: &mut EstablishedSession,
-    packet: Vec<u8>,
+    packets: Vec<Vec<u8>>,
 ) -> Result<()> {
-    let plaintext = Frame {
-        frame_type: 0x01,
-        flags: 0,
-        body: packet,
+    let capacity = MAX_CIPHERTEXT_LEN - 16;
+    for plaintext in batch_packets(packets, capacity)? {
+        send_outbound_record(carrier, session, &plaintext).await?;
     }
-    .encode()?;
-    let record = session.crypto.seal_data(&plaintext, false)?;
+    Ok(())
+}
+
+async fn send_outbound_record(
+    carrier: &mut Carrier,
+    session: &mut EstablishedSession,
+    plaintext: &[u8],
+) -> Result<()> {
+    let record = session.crypto.seal_data(plaintext, false)?;
     carrier.send_binary(record).await
 }
 
@@ -1737,7 +1751,6 @@ async fn process_record(
                             .inspect_err(|_| {
                                 metrics.rekey_failed_total.fetch_add(1, Ordering::Relaxed);
                             })?;
-                        metrics.routine_rekeys_total.fetch_add(1, Ordering::Relaxed);
                         carrier.send_binary(record).await?;
                     }
                     0x07 => {
@@ -1750,6 +1763,7 @@ async fn process_record(
                             .inspect_err(|_| {
                                 metrics.rekey_failed_total.fetch_add(1, Ordering::Relaxed);
                             })?;
+                        metrics.routine_rekeys_total.fetch_add(1, Ordering::Relaxed);
                         carrier.send_binary(record).await?;
                     }
                     0x09 => {
@@ -1763,11 +1777,11 @@ async fn process_record(
                                 &frame.body,
                                 &client.public_key,
                                 &runtime.server_signing,
+                                Instant::now(),
                             )
                             .inspect_err(|_| {
                                 metrics.rekey_failed_total.fetch_add(1, Ordering::Relaxed);
                             })?;
-                        metrics.full_rekeys_total.fetch_add(1, Ordering::Relaxed);
                         carrier.send_binary(record).await?;
                     }
                     0x0B => {
@@ -1780,6 +1794,7 @@ async fn process_record(
                             .inspect_err(|_| {
                                 metrics.rekey_failed_total.fetch_add(1, Ordering::Relaxed);
                             })?;
+                        metrics.full_rekeys_total.fetch_add(1, Ordering::Relaxed);
                         carrier.send_binary(record).await?;
                     }
                     0x12 => return Ok(false),

@@ -1,5 +1,8 @@
 import json
+import hashlib
+import hmac
 import os
+import struct
 import tempfile
 import time
 import unittest
@@ -13,6 +16,9 @@ from client_core import (
     FragmentReassembler,
     H3ProcessCarrier,
     ManifestState,
+    ReplayWindow,
+    RekaSession,
+    SessionParameters,
     _close_carrier,
     _parse_frames,
 )
@@ -22,6 +28,8 @@ from reka_service import (
     create_diagnostics,
     redact_log,
     select_transport_choices,
+    start_service,
+    stop_service,
     transport_mode,
     write_status,
 )
@@ -29,7 +37,34 @@ from network_policy import NetworkPolicy
 from secret_store import protect, unprotect
 from setup import activate_staged_version, rollback_staged_version
 from wintun_adapter import Guid, open_or_create_adapter
-from rekaserdoba.tools.probe import H2_RECEIVE_WINDOW, expand_h2_receive_window
+from rekaserdoba.tools.probe import (
+    H2_RECEIVE_WINDOW,
+    expand_h2_receive_window,
+    expand_label,
+    frame,
+    open_application_record,
+    seal_application_record,
+)
+
+
+def session_secrets(session_id, epoch_secret, control_transcript=None):
+    context = session_id + bytes(4)
+    secrets = {
+        name: expand_label(epoch_secret, label, context, length)
+        for name, label, length in [
+            ("c2s_data_key", "data c2s key", 32),
+            ("s2c_data_key", "data s2c key", 32),
+            ("c2s_data_iv", "data c2s iv", 12),
+            ("s2c_data_iv", "data s2c iv", 12),
+            ("c2s_control_key", "control c2s key", 32),
+            ("s2c_control_key", "control s2c key", 32),
+            ("c2s_control_iv", "control c2s iv", 12),
+            ("s2c_control_iv", "control s2c iv", 12),
+        ]
+    }
+    secrets["epoch_secret"] = epoch_secret
+    secrets["control_transcript"] = control_transcript or bytes(32)
+    return secrets
 
 
 class ClientTests(unittest.TestCase):
@@ -45,8 +80,9 @@ class ClientTests(unittest.TestCase):
     @patch("network_policy._ps")
     def test_endpoint_route_is_prepared_before_tunnel_activation(self, powershell):
         powershell.side_effect = [
-            '{"InterfaceIndex":7,"NextHop":"192.0.2.1"}',
+            '{"InterfaceIndex":7,"NextHop":"192.0.2.1","EndpointExists":false}',
             "",
+            '{"InterfaceIndex":11,"LowExists":false,"HighExists":false,"Dns":["192.0.2.53"],"PhysicalAliases":["Ethernet"]}',
             "",
             "",
         ]
@@ -63,6 +99,31 @@ class ClientTests(unittest.TestCase):
             )
             policy.recover()
             self.assertFalse(state_path.exists())
+            recovery = powershell.call_args_list[-1].args[0]
+            self.assertIn("-InterfaceIndex 11", recovery)
+            self.assertIn("-InterfaceIndex 7", recovery)
+            self.assertIn("RekaSerdoba IPv6", recovery)
+
+    @patch("network_policy._ps")
+    def test_preexisting_routes_are_never_removed(self, powershell):
+        powershell.side_effect = [
+            '{"InterfaceIndex":7,"NextHop":"192.0.2.1","EndpointExists":true}',
+            '{"InterfaceIndex":11,"LowExists":true,"HighExists":true,"Dns":[],"PhysicalAliases":[]}',
+            "",
+            "",
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            policy = NetworkPolicy(
+                Path(temporary) / "network-policy.json",
+                "service.exe",
+                "RekaSerdoba",
+            )
+            policy.install("192.0.2.10")
+            activation = powershell.call_args_list[-2].args[0]
+            self.assertNotIn("New-NetRoute", activation)
+            policy.recover()
+            recovery = powershell.call_args_list[-1].args[0]
+            self.assertNotIn("Remove-NetRoute", recovery)
 
     @patch("rekaserdoba.tools.probe.subprocess.Popen")
     def test_h3_bridge_uses_pinned_server_address(self, popen):
@@ -103,6 +164,22 @@ class ClientTests(unittest.TestCase):
             path.write_text('{"transport":"wss"}', encoding="utf-8")
             self.assertEqual(transport_mode(path), "wss")
 
+    @patch("reka_service.wait_service_state")
+    @patch("reka_service.subprocess.run")
+    def test_service_start_waits_until_running(self, run, wait):
+        start_service()
+        run.assert_called_once_with(["sc.exe", "start", "RekaSerdoba"], check=True)
+        wait.assert_called_once_with("RUNNING")
+
+    @patch("reka_service.NetworkPolicy")
+    @patch("reka_service.wait_service_state")
+    @patch("reka_service.subprocess.run")
+    def test_service_stop_waits_and_recovers_network(self, run, wait, policy):
+        stop_service()
+        run.assert_called_once_with(["sc.exe", "stop", "RekaSerdoba"], check=False)
+        wait.assert_called_once_with("STOPPED")
+        policy.return_value.recover.assert_called_once_with()
+
     def test_existing_wintun_adapter_is_reused(self):
         dll = Mock()
         dll.WintunOpenAdapter.return_value = 17
@@ -134,6 +211,150 @@ class ClientTests(unittest.TestCase):
             body += (0).to_bytes(2, "big") + (1).to_bytes(2, "big") + b"x"
             self.assertIsNone(fragments.push(body))
         self.assertEqual(len(fragments.assemblies), 64)
+
+    def test_replay_window_rejects_records_outside_window(self):
+        replay = ReplayWindow(4096)
+        self.assertTrue(replay.commit_authenticated(0))
+        self.assertTrue(replay.commit_authenticated(4096))
+        self.assertFalse(replay.plausible(0))
+        self.assertFalse(replay.commit_authenticated(0))
+
+    def test_failed_authentication_does_not_consume_record_number(self):
+        session_id = bytes(range(16))
+        secrets = session_secrets(session_id, bytes(range(32)))
+        session = RekaSession(
+            {},
+            Mock(),
+            SessionParameters(session_id, "10.77.0.2", 24, 1280, 3600),
+            secrets,
+        )
+        record = seal_application_record(
+            secrets["s2c_data_key"],
+            secrets["s2c_data_iv"],
+            session_id,
+            0,
+            0,
+            False,
+            frame(0x01, b"packet"),
+        )
+        damaged = record[:-1] + bytes([record[-1] ^ 1])
+        with patch("client_core.recv_ws", return_value=(2, damaged)):
+            with self.assertRaises(Exception):
+                session.receive()
+        with patch("client_core.recv_ws", return_value=(2, record)):
+            self.assertEqual(session.receive(), [b"packet"])
+
+    def test_client_batches_full_mtu_packets(self):
+        session_id = bytes(range(16))
+        secrets = session_secrets(session_id, bytes(range(32)))
+        session = RekaSession(
+            {},
+            Mock(),
+            SessionParameters(session_id, "10.77.0.2", 24, 1280, 3600),
+            secrets,
+        )
+        sent = []
+        packets = [bytes([value]) * 1280 for value in range(3)]
+        with patch("client_core.send_ws", side_effect=lambda _, __, value: sent.append(value)):
+            session.send_packets(packets)
+        self.assertEqual(len(sent), 1)
+        plaintext = open_application_record(
+            secrets["c2s_data_key"],
+            secrets["c2s_data_iv"],
+            session_id,
+            0,
+            0,
+            False,
+            sent[0],
+        )
+        self.assertEqual([body for kind, body in _parse_frames(plaintext)], packets)
+
+    def test_client_completes_server_requested_rekey(self):
+        session_id = bytes(range(16))
+        epoch_secret = bytes(range(32))
+        initial_transcript = bytes(reversed(range(32)))
+        secrets = session_secrets(session_id, epoch_secret, initial_transcript)
+        session = RekaSession(
+            {},
+            Mock(),
+            SessionParameters(session_id, "10.77.0.2", 24, 1280, 3600),
+            secrets,
+        )
+        request = seal_application_record(
+            secrets["s2c_control_key"],
+            secrets["s2c_control_iv"],
+            session_id,
+            0,
+            0,
+            True,
+            frame(0x04, struct.pack(">I", 0)),
+        )
+        sent = []
+        with (
+            patch("client_core.recv_ws", return_value=(2, request)),
+            patch("client_core.send_ws", side_effect=lambda _, __, value: sent.append(value)),
+        ):
+            self.assertEqual(session.receive(), [])
+        self.assertEqual(len(sent), 1)
+        pending = session.pending_rekey
+        next_secret = hmac.new(
+            epoch_secret, pending["context"], hashlib.sha256
+        ).digest()
+        next_context = session_id + struct.pack(">I", 1)
+        confirm_key = expand_label(next_secret, "epoch confirmation", next_context, 32)
+        expected_ack = hmac.new(
+            confirm_key,
+            b"server ack" + pending["context"],
+            hashlib.sha256,
+        ).digest()
+        ack = seal_application_record(
+            secrets["s2c_control_key"],
+            secrets["s2c_control_iv"],
+            session_id,
+            0,
+            1,
+            True,
+            frame(0x06, struct.pack(">I", 1) + expected_ack),
+        )
+        with (
+            patch("client_core.recv_ws", return_value=(2, ack)),
+            patch("client_core.send_ws", side_effect=lambda _, __, value: sent.append(value)),
+        ):
+            self.assertEqual(session.receive(), [])
+        next_s2c_control_key = expand_label(
+            next_secret, "control s2c key", next_context, 32
+        )
+        next_s2c_control_iv = expand_label(
+            next_secret, "control s2c iv", next_context, 12
+        )
+        done_tag = hmac.new(
+            confirm_key,
+            b"server done" + pending["context"],
+            hashlib.sha256,
+        ).digest()
+        done = seal_application_record(
+            next_s2c_control_key,
+            next_s2c_control_iv,
+            session_id,
+            1,
+            0,
+            True,
+            frame(0x08, struct.pack(">I", 1) + done_tag),
+        )
+        with patch("client_core.recv_ws", return_value=(2, done)):
+            self.assertEqual(session.receive(), [])
+        self.assertEqual(session.epoch, 1)
+        self.assertIsNone(session.pending_rekey)
+
+    def test_minimum_lifetime_does_not_expire_immediately(self):
+        session_id = bytes(range(16))
+        session = RekaSession(
+            {},
+            Mock(),
+            SessionParameters(session_id, "10.77.0.2", 24, 1280, 60),
+            session_secrets(session_id, bytes(range(32))),
+        )
+        self.assertFalse(session.expired())
 
     def test_carrier_close_is_idempotent(self):
         class ClosedCarrier:
@@ -279,6 +500,34 @@ class ClientTests(unittest.TestCase):
             )
             with patch("setup.run"):
                 rollback_staged_version(destination, previous)
+            self.assertEqual(
+                (destination / "version.txt").read_text(encoding="utf-8"),
+                "old",
+            )
+
+    def test_staged_activation_restores_previous_version_on_swap_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "RekaSerdoba"
+            destination.mkdir()
+            (destination / "version.txt").write_text("old", encoding="utf-8")
+
+            def copy_new(path):
+                path.mkdir()
+                (path / "version.txt").write_text("new", encoding="utf-8")
+
+            real_replace = os.replace
+
+            def replace(source, target):
+                if Path(source).name.endswith(".new"):
+                    raise OSError("swap failed")
+                return real_replace(source, target)
+
+            with (
+                patch("setup.copy_assets", side_effect=copy_new),
+                patch("setup.os.replace", side_effect=replace),
+            ):
+                with self.assertRaises(OSError):
+                    activate_staged_version(destination)
             self.assertEqual(
                 (destination / "version.txt").read_text(encoding="utf-8"),
                 "old",
