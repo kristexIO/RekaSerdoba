@@ -33,7 +33,7 @@ jobs:
           install -m 0755 net_helper rekaserdoba-net-helper
           sha256sum rekaserdoba-server rekaserdoba-net-helper h3_bridge rekaserdoba-server.cdx.json > SHA256SUMS
           tar -czf rekaserdoba-linux-x86_64.tar.gz rekaserdoba-server rekaserdoba-net-helper h3_bridge rekaserdoba-server.cdx.json SHA256SUMS
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: rekaserdoba-linux-x86_64
           path: rekaserdoba/target/release/rekaserdoba-linux-x86_64.tar.gz
@@ -74,7 +74,7 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}\windows-client;${{ github.workspace }}
       - run: cargo build --locked --release --manifest-path rekaserdoba/Cargo.toml --bin h3_bridge
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: h3-bridge-windows
           path: rekaserdoba/target/release/h3_bridge.exe
